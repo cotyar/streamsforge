@@ -9,3 +9,5 @@ dist/
 .env
 .idea/
 out/
+# graphify knowledge-graph output (generated, ~90 MB)
+graphify-out/
