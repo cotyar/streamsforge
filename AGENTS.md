@@ -400,7 +400,13 @@ Plan 026 wave 2 added `ReplayFromClusterTests.Table_with_replayFrom_over_a_gener
 and `ReplayFromClusterTests.Changing_replayFrom_on_a_running_table_restarts_it`: both count rows after a
 2 s quiesce sized for an idle machine, and under a 12-minute whole-solution run the memory-stream pull
 agent lagged enough that rows arrived live AND through the replay (plan 023's "ONE GAP"), so the count
-overshoots (53 vs 50, 400 vs 100). Pass alone.
+overshoots (53 vs 50, 400 vs 100). Pass alone. The same wave-2 whole-solution run also lost, once each
+and passing alone afterwards: `BatchReplayGrpcTests.Grpc_SubscribeTable_writes_position_and_flags_truncation_past_retention`
+(waits for a 10 005-row file to land as 10 005 table rows — 4 902 after its deadline under load; the
+count is the precondition for proving truncation, not the assertion) and the pre-existing
+`ConnectorGrainClusterTests.Missing_file_reports_error_status_with_growing_backoff` (waits for a
+missing-file source's second failed poll so `ConsecutiveFailures` grows past 1 — a poll cadence race
+under load, not logic).
 Re-run a failure in isolation before calling it a regression — and report BOTH results, never just the
 green one. Nothing else on this list is allowed to grow without a paragraph saying why the test is
 time-bounded; a genuinely broken test hiding among "known flakes" is the failure mode this list can cause.
