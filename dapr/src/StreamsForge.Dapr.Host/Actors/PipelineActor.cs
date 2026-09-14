@@ -161,7 +161,12 @@ public sealed class PipelineActor(
     {
         await DisarmTimerIfArmedAsync();
 
-        var (executor, sourceNames, error) = PipelineCompilation.TryCompile(request.Def, request.Sources);
+        // Plan 026 D5: replayFrom is applied by the Orleans grains' attach gates at start; this flavor has
+        // no position-addressed gate yet (dapr/PARITY.md D11) — same rule as TableActor's shardBy/replayFrom
+        // refusals: the definition stores fine here and never runs here with it set.
+        var (executor, sourceNames, error) = request.Def.ReplayFrom.Count > 0
+            ? (null, [], $"replayFrom must be empty on the Dapr flavor (set for {string.Join(", ", request.Def.ReplayFrom.Keys)}) — replay from a position is Orleans-only until dapr/PARITY.md D11 is closed. The definition is stored as-is so it can be promoted back to an Orleans instance without loss, but it cannot run here.")
+            : PipelineCompilation.TryCompile(request.Def, request.Sources);
         if (executor is null)
         {
             _def = request.Def;

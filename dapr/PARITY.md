@@ -306,9 +306,17 @@ per subscription from 1, and the handle reports `Truncated` whenever a replay wa
 so a client is told rather than silently given live-only. `ConnectorActor` still uses plan 023's
 `SourceReplayBuffer` (count-only ring, no positions). Closing this = switch the three Dapr drivers to
 `ReplayLog`, add `ReplayFrom` to `IConnectorActor.BeginAttachAsync`, and route the fan-out through
-the gate; the log and the wire contract are already shared, so it is wiring, not design. Later plan
-026 waves (pipeline/table logs, the persisted segment log, `replayFrom` on definitions) will add a
-line each here.
+the gate; the log and the wire contract are already shared, so it is wiring, not design.
+
+**Wave 2 (2026-09-14) widened the same debt, same shape:** Orleans' `PipelineGrain` (result batches)
+and classic-mode `TableGrain` (delta batches) now publish through a `ReplayGate<T>` too, gRPC
+`SubscribePipeline`/`SubscribeTable` take `from_seq`/`from_timestamp_ms` and write `position`, and
+`TableDefinition.ReplayFrom`/`PipelineDefinition.ReplayFrom` (keyed by input name) tell a table or
+pipeline where each source/pipeline input starts when it (re)starts. On Dapr: the two facade
+overloads accept and ignore `from` exactly like the source one; a definition with a non-empty
+`replayFrom` STORES fine (config promotion round-trips) but `TableActor.StartAsync` refuses to run it
+with a named reason, the same rule `shardBy` already follows, and `PipelineActor.StartAsync` refuses
+identically. Wave 3 (persisted log) will add its line here.
 
 ---
 
