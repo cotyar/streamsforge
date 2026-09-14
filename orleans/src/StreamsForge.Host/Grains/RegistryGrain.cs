@@ -577,6 +577,10 @@ public sealed class RegistryGrain(
         // Plan 026 D5: executor-affecting exactly like the SQL — replayFrom is applied when the executor is
         // built (StartAsync) and nowhere else, so a change to it on a Running pipeline restarts it.
         var replayFromChanged = !ReplayFromEquals(existing.ReplayFrom, def.ReplayFrom);
+        // Plan 026 D6: the disk tier is attached at StartAsync, before the first publish — so turning
+        // replay.persist (or a bound) on or off on a Running pipeline needs the same restart replayFrom
+        // needs. ReplayConfig is a record, so this is structural, nulls included.
+        var replayChanged = existing.Replay != def.Replay;
         var wasRunning = existing.Status == PipelineStatus.Running;
 
         // Compile-check against the prospective SQL before anything is stored — draft-friendly like
@@ -612,7 +616,7 @@ public sealed class RegistryGrain(
         }
         RecomputeStaleReasons();
 
-        if ((sqlChanged || replayFromChanged) && wasRunning)
+        if ((sqlChanged || replayFromChanged || replayChanged) && wasRunning)
         {
             var pipelineGrain = GrainFactory.GetGrain<IPipelineGrain>(EnvKeys.Qualify(_env, def.Id));
             try
@@ -834,6 +838,10 @@ public sealed class RegistryGrain(
         // "only picked up on (re)start" property retention and the fields above it have — restart for the
         // same reason, so setting or clearing a position on a Running table takes effect now.
         var replayFromChanged = !ReplayFromEquals(existing.ReplayFrom, def.ReplayFrom);
+        // Plan 026 D6: the delta log's disk tier is attached at StartAsync, before the first publish — so
+        // turning replay.persist (or a bound) on or off on a Running table needs the same restart the
+        // fields above need. ReplayConfig is a record, so this is structural, nulls included.
+        var replayChanged = existing.Replay != def.Replay;
         // Plan 011 D1: a ShardBy change re-keys the entire shard tier (or turns it on/off), so it resets
         // the tier below. Plan 011 D2 additionally RESTARTS the table, which D1 explicitly did not: the
         // tier is still only a delta-stream consumer and the grain topology is still unaffected, but
@@ -889,7 +897,7 @@ public sealed class RegistryGrain(
         // (re)StartAsync — mirror the SQL-changed restart below for search config, parallelism, and
         // persistence too, so toggling SearchEnabled/SearchMode/Parallelism/Persistence/FlushMs on a
         // Running table takes effect immediately instead of only on the next manual stop/start.
-        if ((sqlChanged || searchChanged || parallelismChanged || persistenceChanged || retentionChanged || shardByChanged || replayFromChanged) && wasRunning)
+        if ((sqlChanged || searchChanged || parallelismChanged || persistenceChanged || retentionChanged || shardByChanged || replayFromChanged || replayChanged) && wasRunning)
         {
             var tableGrain = GrainFactory.GetGrain<ITableGrain>(EnvKeys.Qualify(_env, def.Name));
             try

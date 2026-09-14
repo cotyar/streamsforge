@@ -7,6 +7,7 @@ using Orleans.Streams;
 using StreamsForge.Abstractions;
 using StreamsForge.AppCore.Connectors;
 using StreamsForge.AppCore.Environments;
+using StreamsForge.AppCore.Streaming;
 using StreamsForge.Engine;
 using StreamsForge.Engine.Dataflow;
 using StreamsForge.Engine.Runtime;
@@ -425,11 +426,42 @@ public sealed class TableGrain(
     /// here — such a table's <see cref="BeginAttachAsync"/> returns an empty snapshot flagged
     /// <c>Truncated</c> whenever a position was asked for (wave 3 owes routing that path through a gate).</summary>
     private ReplayGate<List<TableDeltaDto>>? _gate;
-    private ReplayGate<List<TableDeltaDto>> Gate => _gate ??= new ReplayGate<List<TableDeltaDto>>(
-        DeltaStream,
-        release => this.RegisterGrainTimer(release, ReplayGate<List<TableDeltaDto>>.SafetyRelease, Timeout.InfiniteTimeSpan),
-        _ => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-        batch => batch.Select(d => new TableDeltaDto { Row = new Dictionary<string, object?>(d.Row), Weight = d.Weight, Evicted = d.Evicted, Epoch = d.Epoch }).ToList());
+    private ReplayGate<List<TableDeltaDto>> Gate => _gate ??= CreateGate();
+    private ReplayConfig? _gateReplay;
+    private IGrainTimer? _replayFlushTimer;
+
+    /// <summary>Plan 026 D6 — the delta log's disk tier, classic mode only (coordinator mode publishes from
+    /// <c>TableOutputGrain</c> and has nothing here to persist). Independent of
+    /// <see cref="TablePersistenceMode"/>: the flush timer this arms is a SEPARATE one from
+    /// <see cref="_flushTimer"/> precisely because a <c>MemoryOnly</c> table registers no flush timer at all
+    /// yet still owes its delta log a write-behind flush. Toggling <c>replay.persist</c> drops the gate so
+    /// this rebuilds it — positions then continue from the disk's own <c>LastSeq</c>, or restart at 1 when
+    /// the tier is turned off.</summary>
+    private ReplayGate<List<TableDeltaDto>> CreateGate()
+    {
+        var gate = new ReplayGate<List<TableDeltaDto>>(
+            DeltaStream,
+            release => this.RegisterGrainTimer(release, ReplayGate<List<TableDeltaDto>>.SafetyRelease, Timeout.InfiniteTimeSpan),
+            _ => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            batch => batch.Select(d => new TableDeltaDto { Row = new Dictionary<string, object?>(d.Row), Weight = d.Weight, Evicted = d.Evicted, Epoch = d.Epoch }).ToList());
+        _gateReplay = _def?.Replay;
+        var disk = _coordinatorMode
+            ? null
+            : ReplayPersistence.Open(ServiceProvider, _gateReplay, StreamConstants.TableDeltaNamespace, this.GetPrimaryKeyString());
+        _replayFlushTimer?.Dispose();
+        _replayFlushTimer = null;
+        if (disk is not null)
+        {
+            gate.EnablePersistence(
+                disk,
+                ReplayPayloadJson.Serialize,
+                ReplayPayloadJson.Deserialize<List<TableDeltaDto>>);
+            _replayFlushTimer = this.RegisterGrainTimer(ReplayFlushAsync, ReplayPersistence.FlushPeriod, ReplayPersistence.FlushPeriod);
+        }
+        return gate;
+    }
+
+    private Task ReplayFlushAsync() => _gate?.FlushAsync() ?? Task.CompletedTask;
 
     private IAsyncStream<List<TableDeltaDto>> DeltaStream() =>
         this.GetStreamProvider(StreamConstants.ProviderName)
@@ -453,6 +485,17 @@ public sealed class TableGrain(
         await StopAsync();
 
         _def = def;
+        // Plan 026 D6: rebuild the gate when the replay group changed, then attach the disk tier BEFORE the
+        // attach loop below can publish this start's first delta batch.
+        if (_gate is not null && _gateReplay != def.Replay)
+        {
+            await _gate.FlushAsync();
+            _gate = null;
+        }
+        if (def.Replay is { Persist: true } && def.Parallelism <= 1)
+        {
+            _ = Gate;
+        }
         _shardMirrorSuppressed = def.ShardBy.Count > 0;
         _persistenceMode = def.Persistence;
         _flushInterval = TimeSpan.FromMilliseconds(def.FlushMs > 0 ? def.FlushMs : 2000);
@@ -530,8 +573,15 @@ public sealed class TableGrain(
         _searchIndex = def.SearchEnabled ? new TableSearchIndex(def.SearchMode) : null;
 
         var streamProvider = this.GetStreamProvider(StreamConstants.ProviderName);
+        // Plan 026 D8 — how many of this table's stream inputs were rebuilt from a PERSISTED replay log on
+        // this start. Only when every one of them was (and there are no table inputs, whose own backfill
+        // protocol is a different mechanism) has the executor actually been rebuilt from retained history,
+        // which is exactly what _rebuilding is waiting for.
+        var streamInputCount = 0;
+        var resumedFromLog = 0;
         foreach (var name in compileResult.StreamInputs.Distinct())
         {
+            streamInputCount++;
             // Table-over-pipeline: the engine hands back ONE stream-input list; a name that belongs to a
             // pipeline is read from a different namespace, with a different payload type, keyed by the
             // pipeline's ID rather than its name — so it is split off here rather than inside the
@@ -539,16 +589,29 @@ public sealed class TableGrain(
             var pipeline = pipelines.FirstOrDefault(p => string.Equals(p.Name, name, StringComparison.Ordinal));
             if (pipeline is not null)
             {
-                await SubscribeToPipelineInputAsync(streamProvider, def, name, pipeline);
+                if (await SubscribeToPipelineInputAsync(streamProvider, def, name, pipeline)) resumedFromLog++;
                 continue;
             }
-            await AttachToStreamInputAsync(streamProvider, def, name, sources);
+            if (await AttachToStreamInputAsync(streamProvider, def, name, sources)) resumedFromLog++;
         }
         // Wishlist #14 option (a) — see AttachToTableInputAsync's own doc comment for the full
         // subscribe-then-attach protocol this replaces WarnIfTableInputsAlreadyHoldRowsAsync with.
+        var tableInputCount = 0;
         foreach (var name in compileResult.TableInputs.Distinct())
         {
+            tableInputCount++;
             await AttachToTableInputAsync(streamProvider, def.Environment, def.Name, name);
+        }
+
+        // Plan 026 D8 — the restart-resume limitation lifted, and ONLY when the log can actually lift it.
+        // The executor above was fed every retained row of every stream input, so the operator state this
+        // flag exists to warn about ("rebuilt purely from live traffic, and not caught up yet") has in fact
+        // been rebuilt. Any input NOT resumed from a log — no replay.persist, an attach that threw, or a
+        // table input, whose backfill is a snapshot rather than a history — leaves today's rule untouched,
+        // which is what keeps a table with no persisted inputs byte-for-byte on its pre-026 restart path.
+        if (_rebuilding && streamInputCount > 0 && resumedFromLog == streamInputCount && tableInputCount == 0)
+        {
+            _rebuilding = false;
         }
 
         // MemoryOnly registers no flush timer at all — see class doc's persistence-mode paragraph.
@@ -595,20 +658,36 @@ public sealed class TableGrain(
     /// live-only. An input not named is byte-for-byte the behaviour above. Applied at StartAsync only,
     /// against a brand-new executor, which is the whole of D5: replayed rows carry old <c>_ts</c> values
     /// and would be late events against a live one.</para></summary>
-    private async Task AttachToStreamInputAsync(
+    /// <returns>Plan 026 D8 — true when this input was fed from a PERSISTED replay log (so the executor holds
+    /// that input's retained history, not just whatever arrives live from now on).</returns>
+    private async Task<bool> AttachToStreamInputAsync(
         IStreamProvider streamProvider, TableDefinition def, string name, IEnumerable<SourceDefinition> sources)
     {
         var qualified = EnvKeys.Qualify(def.Environment, name);
         var from = ReplayInputs.For(def.ReplayFrom, name);
 
         var sourceDef = sources.FirstOrDefault(s => s.Name == name);
+        // Plan 026 D8 — a source whose log survives on disk is attached from the START OF RETENTION,
+        // whatever its kind and whatever `replayFrom` said: the point is to build this table's executor
+        // from history rather than wait for live traffic, and a position would only ever narrow that.
+        // Deliberately NOT conditioned on <see cref="_rebuilding"/>, which a MemoryOnly table never sets
+        // (it persists no snapshot to detect a resume BY) — and the restart-resume case D8 is named for is
+        // exactly the one where that table must come back full. The cost on a genuine first start is a
+        // history the operator explicitly asked to keep; `replay.persist` is off by default, so nothing
+        // that did not opt in changes.
+        var resumeFromLog = sourceDef?.Replay is { Persist: true };
+        if (resumeFromLog)
+        {
+            from = null;
+        }
+
         IReplayableSourceGrain? connector = null;
         SourceReplaySnapshot? snapshot = null;
         if (sourceDef is not null)
         {
             try
             {
-                if (from is not null)
+                if (from is not null || resumeFromLog)
                 {
                     connector = ReplayInputs.DriverFor(GrainFactory, sourceDef.Kind, qualified);
                     snapshot = connector is null ? null : await connector.BeginAttachAsync(from);
@@ -636,7 +715,7 @@ public sealed class TableGrain(
 
             if (snapshot is not null && snapshot.Rows.Count > 0)
             {
-                if (from is not null)
+                if (from is not null || resumeFromLog)
                 {
                     // A position that reached past retention is never silent — but it is NOT the
                     // "earlier rows are not recoverable" line below, which describes the default attach's
@@ -670,6 +749,8 @@ public sealed class TableGrain(
                 catch (Exception ex) { logger.LogDebug(ex, "Table '{Table}': releasing the attach hold on source '{Source}' failed; the source's own safety timer covers it.", def.Name, name); }
             }
         }
+
+        return resumeFromLog && snapshot is not null;
     }
 
     /// <summary>Table-over-pipeline: the PIPELINE-input twin of <see cref="AttachToStreamInputAsync"/> —
@@ -694,7 +775,9 @@ public sealed class TableGrain(
     /// exactly this method's own <see cref="OnPipelineBatchAsync"/> handler. An input NOT named keeps the
     /// pre-026 behaviour verbatim — subscribe only, start empty for that input, and restarting the PIPELINE
     /// is still the operator move that re-drives it.</para></summary>
-    private async Task SubscribeToPipelineInputAsync(
+    /// <returns>Plan 026 D8 — true when this input was fed from a PERSISTED replay log (so the executor holds
+    /// that input's retained history, not just whatever arrives live from now on).</returns>
+    private async Task<bool> SubscribeToPipelineInputAsync(
         IStreamProvider streamProvider, TableDefinition def, string name, PipelineDefinition pipeline)
     {
         var key = PipelineInputs.OutputStreamKey(def.Environment, pipeline);
@@ -703,9 +786,16 @@ public sealed class TableGrain(
         // Plan 026 D5 — Begin BEFORE the subscription, exactly like the source path: the hold is what makes
         // "nothing published into the gap" true, so no batch is both replayed and delivered live.
         var from = ReplayInputs.For(def.ReplayFrom, name);
+        // Plan 026 D8 — the pipeline-input twin of the source path above: everything the pipeline's own
+        // persisted result log still retains, regardless of any position asked for.
+        var resumeFromLog = pipeline.Replay is { Persist: true };
+        if (resumeFromLog)
+        {
+            from = null;
+        }
         IPipelineGrain? driver = null;
         StreamReplaySnapshot<List<ResultEnvelope>>? snapshot = null;
-        if (from is not null)
+        if (from is not null || resumeFromLog)
         {
             try
             {
@@ -756,6 +846,8 @@ public sealed class TableGrain(
                 "Table '{Table}': pipeline input '{Pipeline}' is {Status} — this table will receive rows only once that pipeline runs (pipelines have no replay).",
                 def.Name, name, pipeline.Status);
         }
+
+        return resumeFromLog && snapshot is not null;
     }
 
     /// <summary>One published batch from a pipeline input. Fed row by row through the shared
@@ -993,6 +1085,7 @@ public sealed class TableGrain(
     {
         // Batches already produced are batches already owed — same rule as ConnectorGrain.StopAsync.
         await Gate.ForceReleaseAsync();
+        await ReplayFlushAsync(); // plan 026 D6: the write-behind tail is owed to disk before stopping
 
         _status = PipelineStatus.Stopped;
 
@@ -1093,6 +1186,9 @@ public sealed class TableGrain(
         // in-flight FireAndForget background write first (never faulted, so no try/catch needed), then skip
         // entirely for MemoryOnly, otherwise flush (awaited) exactly like Batched always has.
         try { await _pendingWrite; } catch { /* defensive only — WriteStateBestEffortAsync never faults */ }
+        // Plan 026 D6 — deliberately OUTSIDE the MemoryOnly guard below: the replay log is independent of
+        // TablePersistenceMode, so a MemoryOnly table with replay.persist still owes its tail to disk.
+        try { await ReplayFlushAsync(); } catch { /* best-effort */ }
         if (_persistenceMode != TablePersistenceMode.MemoryOnly && _dirty)
         {
             try { await FlushDirtyAsync(); } catch { /* best-effort */ }

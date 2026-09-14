@@ -47,9 +47,33 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
     /// still subscribe to a generator WITHOUT the gate (a continuous source has no "missed first poll"),
     /// until a definition opts in via <c>replayFrom</c> in wave 2.</summary>
     private SourceReplayGate? _gate;
-    private SourceReplayGate Gate => _gate ??= new SourceReplayGate(
-        SourceStream,
-        release => this.RegisterGrainTimer(release, SourceReplayGate.SafetyRelease, Timeout.InfiniteTimeSpan));
+    private SourceReplayGate Gate => _gate ??= CreateGate();
+    private ReplayConfig? _gateReplay;
+    private IGrainTimer? _replayFlushTimer;
+
+    /// <summary>Plan 026 D6 — see <see cref="ConnectorGrain"/>'s identical member for the contract: the disk
+    /// tier is attached before the first publish (a generator has no persisted definition of its own, so
+    /// <see cref="_def"/> is the only source of truth and StartAsync sets it before touching the gate), and
+    /// toggling <c>replay.persist</c> drops the gate so this rebuilds it — positions then continue from the
+    /// disk's own <c>LastSeq</c>, or restart at 1 when the tier is turned off.</summary>
+    private SourceReplayGate CreateGate()
+    {
+        var gate = new SourceReplayGate(
+            SourceStream,
+            release => this.RegisterGrainTimer(release, SourceReplayGate.SafetyRelease, Timeout.InfiniteTimeSpan));
+        _gateReplay = _def?.Replay;
+        var disk = ReplayPersistence.Open(ServiceProvider, _gateReplay, StreamConstants.SourcesNamespace, this.GetPrimaryKeyString());
+        _replayFlushTimer?.Dispose();
+        _replayFlushTimer = null;
+        if (disk is not null)
+        {
+            gate.EnablePersistence(disk, ReplayPersistence.SerializeRow, ReplayPersistence.DeserializeRow);
+            _replayFlushTimer = this.RegisterGrainTimer(ReplayFlushAsync, ReplayPersistence.FlushPeriod, ReplayPersistence.FlushPeriod);
+        }
+        return gate;
+    }
+
+    private Task ReplayFlushAsync() => _gate?.FlushAsync() ?? Task.CompletedTask;
 
     private IAsyncStream<EventRecord> SourceStream() =>
         this.GetStreamProvider(StreamConstants.ProviderName)
@@ -66,6 +90,16 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
         // Rows already produced are rows already owed — same rule as ConnectorGrain.StartAsync.
         await Gate.ForceReleaseAsync();
         _def = def;
+        // Plan 026 D6: rebuild the gate when the replay group changed, so the disk tier follows the flag.
+        if (_gate is not null && _gateReplay != def.Replay)
+        {
+            await _gate.FlushAsync();
+            _gate = null;
+        }
+        if (def.Replay is { Persist: true })
+        {
+            _ = Gate; // attach the disk tier BEFORE the first tick publishes
+        }
         _timer?.Dispose();
         _timer = null;
         _loopbackDrainTimer?.Dispose();
@@ -91,6 +125,7 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
     public async Task StopAsync()
     {
         await Gate.ForceReleaseAsync();
+        await ReplayFlushAsync(); // plan 026 D6: the write-behind tail is owed to disk before stopping
         _timer?.Dispose();
         _timer = null;
         _loopbackDrainTimer?.Dispose();
@@ -102,6 +137,13 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
     }
 
     public Task PingAsync() => Task.CompletedTask;
+
+    /// <summary>Plan 026 D6 — the last write-behind flush; a crash loses only what this would have written.</summary>
+    public override async Task OnDeactivateAsync(DeactivationReason reason, CancellationToken cancellationToken)
+    {
+        try { await ReplayFlushAsync(); } catch { /* best-effort */ }
+        await base.OnDeactivateAsync(reason, cancellationToken);
+    }
 
     /// <summary>Wishlist #8 (whole-batch) and #9(b) (<c>request.Step</c> — see
     /// <see cref="ScenarioRunRequest.Step"/>'s doc comment for the full stepping contract) — see
