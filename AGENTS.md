@@ -218,6 +218,24 @@ never been done before plan 025 (a 164-commit boot-breaking regression, then no 
 Full decision list and what remains unverified (database connectors/CDC, FIX/fix-duplex, NATS on Dapr,
 peer-name discovery FROM a Dapr instance): `dapr/PARITY.md`; the wiring: `dapr/ARCHITECTURE.md`.
 
+**Stream replay** (plan 026, wave 1 on Orleans): every source driver (connector, generator, ingest —
+the new `IngestSourceGrain` is the turn-based owner ingest publishing never had) keeps a
+producer-owned, sequence-numbered `ReplayLog` behind plan 023's attach gate (`SourceReplayGate`, one
+class shared by all three), and `IReplayableSourceGrain.BeginAttachAsync(ReplayFrom?)` hands a
+consumer the retained rows from a **position or an event time** with `Positions/FirstSeq/LastSeq/
+Truncated`. gRPC `SubscribeSource{from_seq|from_timestamp_ms}` and the hub's `SubscribeSourceFrom`
+use it through `IEntityStreamFacade`'s replaying overload; `SourceEvent.position` is now written on
+every event (the same number for every subscriber; `seq` stays per-subscription) and
+`replay_truncated` on the first one when the request reached past retention. Rules that bite:
+Orleans' memory adapter IS rewindable (verified by IL) but only within a 4096-event cache per
+hash-ring queue shared silo-wide, which is why replay lives above the transport; `init` setters on a
+`[GenerateSerializer]` record fail codegen (`ORLEANS0101`); live positions are COUNTED from the
+attach snapshot's `LastSeq`, so a subscription landing inside plan 023's one-pull-period gap can run
+one ahead (tests quiesce 2 s first); tables/pipelines still attach to generator/ingest sources
+without the gate until wave 2's `replayFrom`; positions restart at 1 per activation until wave 3's
+persisted log; Dapr accepts and ignores `from` (`dapr/PARITY.md` § 2b D11). Plan, decisions D1–D9
+and per-wave outcomes: `plans/026-stream-replay.md`.
+
 **Environment isolation** (plan 021): an environment is the **registry KEY**, not a column — Orleans
 activates a whole separate `RegistryGrain` per environment (Dapr: `RegistryActor`), so two same-named
 tables in two environments are two grains with two states, not one filtered read. `default` is the
@@ -361,6 +379,13 @@ relayed hub calls) and the pre-existing `StreamBridgeServiceStartupRaceTests` fa
 table's first delta). Also, ten `TestClusterPortAllocator.MutexManager` timeouts (tests failing in ~1 ms while BUILDING their
 cluster) appeared in the same loaded run and vanished in isolation — that signature is the Orleans test
 port allocator's system-wide mutex under contention, never a test's own logic.
+Plan 026 wave 1 (2026-09-14) added two more, each observed once in a whole-solution run by the wave's
+agent and passing alone: `SourceReplayFromClusterTests.Generator_source_replays_from_a_position` (waits
+for a 100 events/s generator to reach position 300 — reached 238 under load inside the original 30 s;
+the deadline is now 90 s and the test asserts positions, not timing) and
+`TableOverPipelineClusterTests.A_partitioned_table_reads_a_pipeline_through_its_ingest_grains` (polls a
+partitioned table's row count to 150 within a deadline; 82 under load, 150/150 alone — the ingest-grain
+hop is one more async stage the count has to cross).
 Re-run a failure in isolation before calling it a regression — and report BOTH results, never just the
 green one. Nothing else on this list is allowed to grow without a paragraph saying why the test is
 time-bounded; a genuinely broken test hiding among "known flakes" is the failure mode this list can cause.
