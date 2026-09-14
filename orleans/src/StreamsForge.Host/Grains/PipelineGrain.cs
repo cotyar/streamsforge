@@ -7,6 +7,7 @@ using StreamsForge.AppCore.Connectors;
 using StreamsForge.AppCore.Environments;
 using StreamsForge.Engine;
 using StreamsForge.Host.Facades;
+using StreamsForge.Host.Streaming;
 
 namespace StreamsForge.Host.Grains;
 
@@ -35,6 +36,27 @@ public sealed class PipelineGrain(ILogger<PipelineGrain> logger) : Grain, IPipel
     private DateTimeOffset _lastMetricsTickAt;
     private double _lastEventsInPerSec;
     private double _lastRowsOutPerSec;
+
+    /// <summary>Plan 026 wave 2: every result batch leaves through this gate, so a gRPC/SignalR subscriber
+    /// (or a table with <c>replayFrom</c> naming this pipeline) can attach from a batch position. A batch's
+    /// event time is its first envelope's <c>TimestampMs</c>.</summary>
+    private ReplayGate<List<ResultEnvelope>>? _gate;
+    private ReplayGate<List<ResultEnvelope>> Gate => _gate ??= new ReplayGate<List<ResultEnvelope>>(
+        OutputStream,
+        release => this.RegisterGrainTimer(release, ReplayGate<List<ResultEnvelope>>.SafetyRelease, Timeout.InfiniteTimeSpan),
+        batch => batch.Count > 0 ? batch[0].TimestampMs : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        batch => batch.Select(e => new ResultEnvelope { PipelineId = e.PipelineId, Seq = e.Seq, TimestampMs = e.TimestampMs, Row = new Dictionary<string, object?>(e.Row) }).ToList());
+
+    // Plan 021 D6 — self-publish onto THIS pipeline's own output stream: this.GetPrimaryKeyString() is
+    // already the D3-qualified key (IPipelineGrain is qualified uniformly like every other name/id-keyed
+    // grain kind), so it is correct here without re-deriving anything from _def.
+    private IAsyncStream<List<ResultEnvelope>> OutputStream() =>
+        this.GetStreamProvider(StreamConstants.ProviderName)
+            .GetStream<List<ResultEnvelope>>(StreamId.Create(StreamConstants.OutputNamespace, this.GetPrimaryKeyString()));
+
+    public Task<StreamReplaySnapshot<List<ResultEnvelope>>> BeginAttachAsync(ReplayFrom? from) => Task.FromResult(Gate.Begin(from));
+
+    public Task EndAttachAsync() => Gate.EndAsync();
 
     public async Task StartAsync(PipelineDefinition def)
     {
@@ -80,6 +102,9 @@ public sealed class PipelineGrain(ILogger<PipelineGrain> logger) : Grain, IPipel
 
     public async Task StopAsync()
     {
+        // Batches already produced are batches already owed — same rule as ConnectorGrain.StopAsync.
+        await Gate.ForceReleaseAsync();
+
         _status = PipelineStatus.Stopped;
 
         _timer?.Dispose();
@@ -254,12 +279,7 @@ public sealed class PipelineGrain(ILogger<PipelineGrain> logger) : Grain, IPipel
             _recentResults.RemoveRange(0, _recentResults.Count - RecentResultsCapacity);
         }
 
-        // Plan 021 D6 — self-publish onto THIS pipeline's own output stream: this.GetPrimaryKeyString() is
-        // already the D3-qualified key (IPipelineGrain is qualified uniformly like every other name/id-keyed
-        // grain kind), so it is correct here without re-deriving anything from _def.
-        var stream = this.GetStreamProvider(StreamConstants.ProviderName)
-            .GetStream<List<ResultEnvelope>>(StreamId.Create(StreamConstants.OutputNamespace, this.GetPrimaryKeyString()));
-        await stream.OnNextAsync(batch);
+        await Gate.PublishAsync(batch);
     }
 
     private async Task PublishMetricsAsync()

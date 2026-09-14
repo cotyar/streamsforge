@@ -82,6 +82,24 @@ public interface IEntityStreamFacade
     /// publish under). No sequence number — see the block comment.</summary>
     Task<IAsyncDisposable> SubscribeTableAsync(
         string environment, string tableName, Func<IReadOnlyList<TableDeltaDto>, Task> onDeltas);
+
+    /// <summary>Plan 026 wave 2 — <see cref="SubscribePipelineAsync(string, string, Func{IReadOnlyList{ResultEnvelope}, Task})"/>
+    /// started from a position or an event time; the callback's second argument is the BATCH position
+    /// (retained batches first, then live ones with consecutive positions). Same contract as the source
+    /// overload, batch-grained.</summary>
+    Task<IEntityReplaySubscription> SubscribePipelineAsync(
+        string environment, string pipelineId, ReplayFrom? from,
+        Func<IReadOnlyList<ResultEnvelope>, long, Task> onResults);
+
+    /// <summary>Plan 026 wave 2 — <see cref="SubscribeTableAsync(string, string, Func{IReadOnlyList{TableDeltaDto}, Task})"/>
+    /// started from a position or a PUBLISH time (a delta batch has no event time of its own, so
+    /// <see cref="ReplayFrom.TimestampMs"/> filters on the wall clock at publish). No base snapshot is
+    /// implied — a consumer that needs one takes <c>AttachSnapshotAsync</c>'s (rows, epoch, LastSeq) and asks
+    /// for <c>Seq = LastSeq + 1</c>; a CDC/audit consumer wants exactly the change log and asks from
+    /// wherever it left off.</summary>
+    Task<IEntityReplaySubscription> SubscribeTableAsync(
+        string environment, string tableName, ReplayFrom? from,
+        Func<IReadOnlyList<TableDeltaDto>, long, Task> onDeltas);
 }
 
 /// <summary>Plan 026 — a replaying subscription's handle. Disposing unsubscribes exactly this subscription.

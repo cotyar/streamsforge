@@ -76,6 +76,26 @@ public sealed class EntityStreamFanout : ISourceEventsSink, ITableDeltaSink, IPi
         return new ReplayHandle(inner, truncated: from is { IsEmpty: false });
     }
 
+    /// <summary>Plan 026 wave 2 — same rule as the source overload: `from` accepted and ignored, owed
+    /// in dapr/PARITY.md D11.</summary>
+    public async Task<IEntityReplaySubscription> SubscribePipelineAsync(
+        string environment, string pipelineId, ReplayFrom? from,
+        Func<IReadOnlyList<ResultEnvelope>, long, Task> onResults)
+    {
+        long position = 0;
+        var inner = await SubscribePipelineAsync(environment, pipelineId, rows => onResults(rows, ++position));
+        return new ReplayHandle(inner, truncated: from is { IsEmpty: false });
+    }
+
+    public async Task<IEntityReplaySubscription> SubscribeTableAsync(
+        string environment, string tableName, ReplayFrom? from,
+        Func<IReadOnlyList<TableDeltaDto>, long, Task> onDeltas)
+    {
+        long position = 0;
+        var inner = await SubscribeTableAsync(environment, tableName, deltas => onDeltas(deltas, ++position));
+        return new ReplayHandle(inner, truncated: from is { IsEmpty: false });
+    }
+
     private sealed class ReplayHandle(IAsyncDisposable inner, bool truncated) : IEntityReplaySubscription
     {
         public long FirstSeq => 1;

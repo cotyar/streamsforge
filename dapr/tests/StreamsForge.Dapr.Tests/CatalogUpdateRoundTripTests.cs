@@ -116,6 +116,12 @@ public class CatalogUpdateRoundTripTests
             return new List<EntityPin> { new() { Kind = "source", Name = $"dep_{prop.Name}", SchemaRevision = 7 } };
         }
 
+        // Plan 026: replayFrom is client-owned — the author's choice of where each input starts.
+        if (type == typeof(Dictionary<string, ReplayFrom>))
+        {
+            return new Dictionary<string, ReplayFrom> { [$"in_{prop.Name}"] = new ReplayFrom { Seq = 42 } };
+        }
+
         if (type == typeof(List<SinkSpec>))
         {
             return new List<SinkSpec>

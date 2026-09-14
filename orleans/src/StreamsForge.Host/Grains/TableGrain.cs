@@ -12,6 +12,7 @@ using StreamsForge.Engine.Dataflow;
 using StreamsForge.Engine.Runtime;
 using StreamsForge.Host.Facades;
 using StreamsForge.Host.Search;
+using StreamsForge.Host.Streaming;
 
 namespace StreamsForge.Host.Grains;
 
@@ -416,6 +417,34 @@ public sealed class TableGrain(
     /// doc's consistency statement). Null until OnOutputBatchAsync has observed at least one full round
     /// (every terminal partition reporting) since the last StartCoordinatorAsync.</summary>
     private long? _snapshotFrontierEpoch;
+
+    /// <summary>Plan 026 wave 2: every CLASSIC-mode delta batch leaves through this gate, so a gRPC/SignalR
+    /// subscriber can attach from a batch position and <see cref="AttachSnapshotAsync"/> can report
+    /// <c>LastSeq</c>. A delta batch has no event time of its own, so its log timestamp is the wall clock
+    /// at publish. Coordinator mode (Parallelism ≥ 2) publishes from <c>TableOutputGrain</c>, NOT through
+    /// here — such a table's <see cref="BeginAttachAsync"/> returns an empty snapshot flagged
+    /// <c>Truncated</c> whenever a position was asked for (wave 3 owes routing that path through a gate).</summary>
+    private ReplayGate<List<TableDeltaDto>>? _gate;
+    private ReplayGate<List<TableDeltaDto>> Gate => _gate ??= new ReplayGate<List<TableDeltaDto>>(
+        DeltaStream,
+        release => this.RegisterGrainTimer(release, ReplayGate<List<TableDeltaDto>>.SafetyRelease, Timeout.InfiniteTimeSpan),
+        _ => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        batch => batch.Select(d => new TableDeltaDto { Row = new Dictionary<string, object?>(d.Row), Weight = d.Weight, Evicted = d.Evicted, Epoch = d.Epoch }).ToList());
+
+    private IAsyncStream<List<TableDeltaDto>> DeltaStream() =>
+        this.GetStreamProvider(StreamConstants.ProviderName)
+            .GetStream<List<TableDeltaDto>>(StreamId.Create(StreamConstants.TableDeltaNamespace, this.GetPrimaryKeyString()));
+
+    public Task<StreamReplaySnapshot<List<TableDeltaDto>>> BeginAttachAsync(ReplayFrom? from)
+    {
+        if (_coordinatorMode)
+        {
+            return Task.FromResult(new StreamReplaySnapshot<List<TableDeltaDto>> { Truncated = from is { IsEmpty: false } });
+        }
+        return Task.FromResult(Gate.Begin(from));
+    }
+
+    public Task EndAttachAsync() => _coordinatorMode ? Task.CompletedTask : Gate.EndAsync();
 
     public async Task StartAsync(TableDefinition def)
     {
@@ -886,6 +915,9 @@ public sealed class TableGrain(
 
     public async Task StopAsync()
     {
+        // Batches already produced are batches already owed — same rule as ConnectorGrain.StopAsync.
+        await Gate.ForceReleaseAsync();
+
         _status = PipelineStatus.Stopped;
 
         _flushTimer?.Dispose();
@@ -1149,7 +1181,8 @@ public sealed class TableGrain(
         var classicRows = _executor.Snapshot().Values
             .Select(v => new TableRowDto { Row = new Dictionary<string, object?>(v.Row), Weight = v.Weight })
             .ToList();
-        return Task.FromResult(new TableAttachSnapshot { Rows = classicRows, Epoch = _executor.LastEpoch });
+        // Plan 026 D7: LastSeq read in the same turn as the rows and the epoch — no await between them.
+        return Task.FromResult(new TableAttachSnapshot { Rows = classicRows, Epoch = _executor.LastEpoch, LastSeq = Gate.LastSeq });
     }
 
     public Task<long> GetSeqAsync() => Task.FromResult(state.State.Seq);
@@ -1445,9 +1478,7 @@ public sealed class TableGrain(
         // it, exactly like Evicted.
         var epoch = _executor!.LastEpoch;
         var dtos = deltas.Select(d => new TableDeltaDto { Row = new Dictionary<string, object?>(d.Row), Weight = d.Weight, Evicted = d.Retention, Epoch = epoch }).ToList();
-        var stream = this.GetStreamProvider(StreamConstants.ProviderName)
-            .GetStream<List<TableDeltaDto>>(StreamId.Create(StreamConstants.TableDeltaNamespace, this.GetPrimaryKeyString()));
-        await stream.OnNextAsync(dtos);
+        await Gate.PublishAsync(dtos);
     }
 
     /// <summary>Plan 011 wave C — the distinct canonical row keys one delta batch touched, derived ONCE

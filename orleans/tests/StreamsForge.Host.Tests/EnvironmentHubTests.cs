@@ -406,6 +406,16 @@ public sealed class EnvironmentHubTests
             Func<IReadOnlyDictionary<string, object?>, long, long, Task> onEvent) =>
             throw new NotImplementedException("not exercised by this test");
 
+        public Task<IEntityReplaySubscription> SubscribePipelineAsync(
+            string environment, string pipelineId, ReplayFrom? from,
+            Func<IReadOnlyList<ResultEnvelope>, long, Task> onResults) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IEntityReplaySubscription> SubscribeTableAsync(
+            string environment, string tableName, ReplayFrom? from,
+            Func<IReadOnlyList<TableDeltaDto>, long, Task> onDeltas) =>
+            throw new NotImplementedException("not exercised by this test");
+
         public Task<IAsyncDisposable> SubscribePipelineAsync(
             string environment, string pipelineId, Func<IReadOnlyList<ResultEnvelope>, Task> onResults) =>
             throw new NotImplementedException("not exercised by this test");

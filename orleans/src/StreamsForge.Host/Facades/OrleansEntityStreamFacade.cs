@@ -159,6 +159,19 @@ public sealed class OrleansEntityStreamFacade(IClusterClient client) : IEntitySt
         return new Handle<List<TableDeltaDto>>(await stream.SubscribeAsync((deltas, _) => onDeltas(deltas)));
     }
 
+    /// <summary>Plan 026 wave 2 — STUBS pinned by the orchestrator so both hosts build; wave 2 agent A
+    /// replaces them with the gated implementation over <see cref="IPipelineGrain"/>/<see cref="ITableGrain"/>
+    /// (key = qualified pipeline ID / qualified table NAME), mirroring the source overload above.</summary>
+    public Task<IEntityReplaySubscription> SubscribePipelineAsync(
+        string environment, string pipelineId, ReplayFrom? from,
+        Func<IReadOnlyList<ResultEnvelope>, long, Task> onResults) =>
+        throw new NotImplementedException("plan 026 wave 2 agent A");
+
+    public Task<IEntityReplaySubscription> SubscribeTableAsync(
+        string environment, string tableName, ReplayFrom? from,
+        Func<IReadOnlyList<TableDeltaDto>, long, Task> onDeltas) =>
+        throw new NotImplementedException("plan 026 wave 2 agent A");
+
     private sealed class Handle<T>(StreamSubscriptionHandle<T> handle) : IAsyncDisposable
     {
         public async ValueTask DisposeAsync() => await handle.UnsubscribeAsync();

@@ -541,6 +541,15 @@ public sealed class PipelineDefinition
     /// recompiles those, driven off the data (empty <c>OutputFields</c>) rather than off whether seeding
     /// just happened, exactly like the <see cref="SourceNames"/> backfill it extends.</para></summary>
     [Id(18)] public List<FieldDef> OutputFields { get; set; } = [];
+
+    /// <summary>Plan 026 D5 (additive): where each STREAM input starts when this pipeline (re)starts,
+    /// keyed by input (source) name — a producer position or an event time (see <see cref="ReplayFrom"/>).
+    /// Applied at start only, when the executor is fresh: replaying into a live executor would make every
+    /// replayed row a late event (the Engine drops rows older than its watermark minus 1 s), so changing
+    /// this on a Running pipeline RESTARTS it, like an SQL edit. An input not named here attaches exactly as
+    /// before (plan 023's default late-attach for connector sources; live-only for generators/ingest).
+    /// Dapr stores it and refuses to START with it set (`dapr/PARITY.md` D11). Empty = off.</summary>
+    [Id(19)] public Dictionary<string, ReplayFrom> ReplayFrom { get; set; } = [];
 }
 
 /// <summary>One emitted result row. Values are primitives only (string/double/long/bool/null).</summary>
@@ -874,6 +883,14 @@ public sealed class TableDefinition
     /// on. Same for a pipeline that stops or is deleted underneath a running table — the table stays
     /// Running and simply receives nothing more. Neither is refused.</para></summary>
     [Id(36)] public List<string> PipelineInputs { get; set; } = [];
+
+    /// <summary>Plan 026 D5 (additive): where each SOURCE or PIPELINE input starts when this table
+    /// (re)starts, keyed by input name — a producer position or an event time (see <see cref="ReplayFrom"/>).
+    /// Applied at start only (fresh executor — see <see cref="PipelineDefinition.ReplayFrom"/> for why);
+    /// changing it on a Running table restarts it. A TABLE input cannot be named here (its rows arrive
+    /// through the backfill snapshot, plan 023's protocol; a position on a table input is wave 3 work) and
+    /// validation refuses it with that reason. Dapr stores it and refuses to START with it set. Empty = off.</summary>
+    [Id(37)] public Dictionary<string, ReplayFrom> ReplayFrom { get; set; } = [];
 }
 
 /// <summary>Plan 008: per-table durability policy. State is the materialized snapshot; the question is only

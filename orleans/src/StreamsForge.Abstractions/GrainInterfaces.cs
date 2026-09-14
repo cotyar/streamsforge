@@ -11,8 +11,39 @@ public interface IRegistryGrain : ICatalogFacade, IGrainWithStringKey
     Task EnsureInitializedAsync();
 }
 
-/// <summary>Key = pipeline id. One activation per running pipeline.</summary>
-public interface IPipelineGrain : IGrainWithStringKey
+/// <summary>Plan 026 wave 2 — the batch-typed twin of <see cref="SourceReplaySnapshot"/>: what a
+/// pipeline (<c>T = List&lt;ResultEnvelope&gt;</c>) or a table (<c>T = List&lt;TableDeltaDto&gt;</c>) hands a
+/// consumer that asked to attach from <see cref="ReplayFrom"/>. <see cref="Items"/> are the retained
+/// stream items (one item = one published batch, the unit the stream carries), oldest first, with
+/// <see cref="Positions"/> parallel to them; the rest reads as on <see cref="SourceReplaySnapshot"/>.</summary>
+[GenerateSerializer]
+public sealed class StreamReplaySnapshot<T>
+{
+    [Id(0)] public List<T> Items { get; set; } = [];
+    [Id(1)] public List<long> Positions { get; set; } = [];
+    [Id(2)] public long TotalSeen { get; set; }
+    [Id(3)] public long FirstSeq { get; set; }
+    [Id(4)] public long LastSeq { get; set; }
+    [Id(5)] public bool Truncated { get; set; }
+}
+
+/// <summary>Plan 026 wave 2 — the attach gate as the replay API for a BATCH-publishing grain (a pipeline's
+/// result batches, a table's delta batches), the exact protocol of <see cref="IReplayableSourceGrain"/>
+/// with a batch-typed snapshot: Begin(from) → subscribe → feed the items through the same handler → End in
+/// a <c>finally</c>. A position is per published BATCH (the stream item), not per row.</summary>
+public interface IReplayableBatchGrain<T> : IGrainWithStringKey
+{
+    Task<StreamReplaySnapshot<T>> BeginAttachAsync(ReplayFrom? from);
+
+    /// <summary>Drops one hold; at zero, everything deferred while held is published. Always in a
+    /// <c>finally</c>.</summary>
+    Task EndAttachAsync();
+}
+
+/// <summary>Key = pipeline id. One activation per running pipeline. Plan 026 wave 2: also a
+/// <see cref="IReplayableBatchGrain{T}"/> over its result batches (position = batch; a batch's event time
+/// is its first envelope's <c>TimestampMs</c>).</summary>
+public interface IPipelineGrain : IReplayableBatchGrain<List<ResultEnvelope>>
 {
     Task StartAsync(PipelineDefinition def);
     Task StopAsync();
@@ -60,13 +91,20 @@ public sealed class TableAttachSnapshot
     /// unconditionally in that case, since nothing is yet reflected in <see cref="Rows"/> to double-count
     /// against.</summary>
     [Id(1)] public long Epoch { get; set; } = -1;
+
+    /// <summary>Plan 026 D7 (additive): the position of the last delta batch this table had PUBLISHED when
+    /// the snapshot was taken — the same number a concurrent replaying subscriber sees on that batch — so a
+    /// consumer can take (rows, epoch, position) atomically and ask the delta log for everything after it.
+    /// 0 = nothing published yet this activation. Coordinator-mode tables (Parallelism ≥ 2) report 0: their
+    /// deltas are published by <c>TableOutputGrain</c>, not through this grain's gate (wave 3 owes that).</summary>
+    [Id(2)] public long LastSeq { get; set; }
 }
 
 /// <summary>Key = table name. One activation per running table. Materializes a Z-set (DBSP-style)
 /// incremental view: subscribes to its SQL's stream and table inputs, feeds deltas through a
 /// StreamsForge.Engine TableExecutor, and publishes emitted deltas + persists a consolidated snapshot for
 /// rehydration-free reads.</summary>
-public interface ITableGrain : IGrainWithStringKey
+public interface ITableGrain : IReplayableBatchGrain<List<TableDeltaDto>>
 {
     Task StartAsync(TableDefinition def);
     Task StopAsync();

@@ -310,6 +310,10 @@ message SourceEvent {
 
 message SubscribePipelineRequest {
   string id = 1;
+  // Plan 026: start from a producer BATCH position (1-based; 0 = unset) or an event time (epoch ms;
+  // 0 = unset); from_seq wins. Retained batches first, then live, positions consecutive.
+  int64 from_seq = 2;
+  int64 from_timestamp_ms = 3;
 }
 
 // One emitted pipeline result row — flattened 1:1 from the underlying result batches.
@@ -318,10 +322,20 @@ message ResultEnvelope {
   int64 seq = 2;
   int64 timestamp_ms = 3;
   google.protobuf.Struct row = 4;
+  // Plan 026: the producer's position of the BATCH this row came from (rows of one batch share it);
+  // pass it back as from_seq. seq stays the per-subscription row counter.
+  int64 position = 5;
+  // Plan 026: set on the first row of a subscription when the request reached past retention.
+  bool replay_truncated = 6;
 }
 
 message SubscribeTableRequest {
   string name = 1;
+  // Plan 026: start from a producer batch position (1-based; 0 = unset) or a PUBLISH time (epoch ms;
+  // 0 = unset — a delta batch has no event time of its own); from_seq wins. No base snapshot is
+  // implied: pair it with TableService.GetRows or a prior batch's position.
+  int64 from_seq = 2;
+  int64 from_timestamp_ms = 3;
 }
 
 message TableDelta {
@@ -335,6 +349,11 @@ message TableDeltaBatch {
   string table_name = 1;
   int64 seq = 2;
   repeated TableDelta deltas = 3;
+  // Plan 026: the producer's position of this batch — the same for every subscriber; pass it back as
+  // from_seq. seq stays the per-subscription counter.
+  int64 position = 4;
+  // Plan 026: set on the first batch of a subscription when the request reached past retention.
+  bool replay_truncated = 5;
 }
 
 service StreamService {

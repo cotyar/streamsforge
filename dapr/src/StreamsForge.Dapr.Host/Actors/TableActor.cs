@@ -372,6 +372,18 @@ public sealed class TableActor(ActorHost host, DaprClient daprClient, TableEvent
                 $"shardBy must be empty on the Dapr flavor (got {string.Join(", ", _def.ShardBy)}) — key sharding is Orleans-only. The definition is stored as-is so it can be promoted back to an Orleans instance without loss, but it cannot run here.");
         }
 
+        // Plan 026 D5: replayFrom is applied by the Orleans grains' attach gates at start; this flavor has
+        // no position-addressed gate yet (dapr/PARITY.md D11), so — same rule as shardBy above — the
+        // definition stores fine here and never runs here with it set.
+        if (_def.ReplayFrom.Count > 0)
+        {
+            _executor = null;
+            _running = false;
+            await SaveControlStateAsync();
+            return ActorResult<TableInputNames>.Failure(
+                $"replayFrom must be empty on the Dapr flavor (set for {string.Join(", ", _def.ReplayFrom.Keys)}) — replay from a position is Orleans-only until dapr/PARITY.md D11 is closed. The definition is stored as-is so it can be promoted back to an Orleans instance without loss, but it cannot run here.");
+        }
+
         ActivateExecutor();
         if (_executor is null)
         {
