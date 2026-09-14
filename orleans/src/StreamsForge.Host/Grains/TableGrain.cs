@@ -585,21 +585,38 @@ public sealed class TableGrain(
     ///
     /// <para>The gate is best-effort in ONE direction only: if <c>BeginAttachAsync</c> itself throws, this
     /// falls back to a plain subscription rather than refusing to start the table. Losing the backfill is
-    /// bad; refusing to start is worse.</para></summary>
+    /// bad; refusing to start is worse.</para>
+    ///
+    /// <para>PLAN 026 D5 — an input NAMED in <see cref="TableDefinition.ReplayFrom"/> attaches from that
+    /// POSITION instead, through the same protocol, and does so for a generator and an ingest source too
+    /// (<see cref="ReplayInputs.DriverFor"/>) — the three kinds the default path deliberately leaves
+    /// live-only. An input not named is byte-for-byte the behaviour above. Applied at StartAsync only,
+    /// against a brand-new executor, which is the whole of D5: replayed rows carry old <c>_ts</c> values
+    /// and would be late events against a live one.</para></summary>
     private async Task AttachToStreamInputAsync(
         IStreamProvider streamProvider, TableDefinition def, string name, IEnumerable<SourceDefinition> sources)
     {
         var qualified = EnvKeys.Qualify(def.Environment, name);
+        var from = ReplayInputs.For(def.ReplayFrom, name);
 
         var sourceDef = sources.FirstOrDefault(s => s.Name == name);
-        IConnectorGrain? connector = null;
+        IReplayableSourceGrain? connector = null;
         SourceReplaySnapshot? snapshot = null;
-        if (sourceDef is not null && SourceKindDispatch.Classify(sourceDef.Kind) == SourceKindDispatch.ActorKind.Connector)
+        if (sourceDef is not null)
         {
-            connector = GrainFactory.GetGrain<IConnectorGrain>(qualified);
             try
             {
-                snapshot = await connector.BeginAttachAsync();
+                if (from is not null)
+                {
+                    connector = ReplayInputs.DriverFor(GrainFactory, sourceDef.Kind, qualified);
+                    snapshot = connector is null ? null : await connector.BeginAttachAsync(from);
+                }
+                else if (SourceKindDispatch.Classify(sourceDef.Kind) == SourceKindDispatch.ActorKind.Connector)
+                {
+                    var driver = GrainFactory.GetGrain<IConnectorGrain>(qualified);
+                    connector = driver;
+                    snapshot = await driver.BeginAttachAsync();
+                }
             }
             catch (Exception ex)
             {
@@ -617,7 +634,17 @@ public sealed class TableGrain(
 
             if (snapshot is not null && snapshot.Rows.Count > 0)
             {
-                if (snapshot.TotalSeen > snapshot.Rows.Count)
+                if (from is not null)
+                {
+                    // A position that reached past retention is never silent — but it is NOT the
+                    // "earlier rows are not recoverable" line below, which describes the default attach's
+                    // whole-ring hand-over and would misread a deliberate `seq: 401` as a loss.
+                    if (snapshot.Truncated)
+                    {
+                        ReplayInputs.WarnTruncated(logger, def.Name, name, snapshot.FirstSeq);
+                    }
+                }
+                else if (snapshot.TotalSeen > snapshot.Rows.Count)
                 {
                     // NOTE (same rule as AttachToTableInputAsync's warning below): each placeholder name
                     // appears exactly once — the structured-logging formatter binds positionally.
@@ -655,21 +682,68 @@ public sealed class TableGrain(
     /// matches its relation on), so GROUP BY / JOIN / LATEST BY state is built from these rows rather than
     /// bypassed.</para>
     ///
-    /// <para><b>NO LATE-CONSUMER ATTACH, and it is not an omission.</b> The subscribe-then-attach protocol
-    /// above exists because a connector-kind source keeps a replay ring and can be held still for one
-    /// turn while its recent rows are handed over. A pipeline has neither: it holds no materialized
-    /// result, and its bounded <c>_recentResults</c> buffer is a UI convenience with no epoch or fence to
-    /// deduplicate against live traffic — replaying it would double-count with nothing to detect the
-    /// overlap. So a table that attaches to a pipeline starts empty for that input and sees only rows
-    /// published from this moment on. Restarting the PIPELINE (not the table) is the operator move that
-    /// re-drives it, and it is written down in the docs for that reason.</para></summary>
+    /// <para><b>NO LATE-CONSUMER ATTACH BY DEFAULT, and it was not an omission.</b> The subscribe-then-attach
+    /// protocol above exists because a connector-kind source keeps a replay ring and can be held still for
+    /// one turn while its recent rows are handed over. Before plan 026 wave 2 a pipeline had neither: it
+    /// holds no materialized result, and its bounded <c>_recentResults</c> buffer is a UI convenience with
+    /// no position to deduplicate against live traffic. Wave 2 gave <c>PipelineGrain</c> the same gate over
+    /// its RESULT BATCHES (<see cref="IReplayableBatchGrain{T}"/>), so a table whose
+    /// <see cref="TableDefinition.ReplayFrom"/> names this pipeline replays from a batch position through
+    /// exactly this method's own <see cref="OnPipelineBatchAsync"/> handler. An input NOT named keeps the
+    /// pre-026 behaviour verbatim — subscribe only, start empty for that input, and restarting the PIPELINE
+    /// is still the operator move that re-drives it.</para></summary>
     private async Task SubscribeToPipelineInputAsync(
         IStreamProvider streamProvider, TableDefinition def, string name, PipelineDefinition pipeline)
     {
-        var stream = streamProvider.GetStream<List<ResultEnvelope>>(
-            StreamId.Create(StreamConstants.OutputNamespace, PipelineInputs.OutputStreamKey(def.Environment, pipeline)));
-        var handle = await stream.SubscribeAsync((batch, _) => OnPipelineBatchAsync(name, batch));
-        _pipelineSubs.Add(handle);
+        var key = PipelineInputs.OutputStreamKey(def.Environment, pipeline);
+        var stream = streamProvider.GetStream<List<ResultEnvelope>>(StreamId.Create(StreamConstants.OutputNamespace, key));
+
+        // Plan 026 D5 — Begin BEFORE the subscription, exactly like the source path: the hold is what makes
+        // "nothing published into the gap" true, so no batch is both replayed and delivered live.
+        var from = ReplayInputs.For(def.ReplayFrom, name);
+        IPipelineGrain? driver = null;
+        StreamReplaySnapshot<List<ResultEnvelope>>? snapshot = null;
+        if (from is not null)
+        {
+            try
+            {
+                driver = GrainFactory.GetGrain<IPipelineGrain>(key);
+                snapshot = await driver.BeginAttachAsync(from);
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "Table '{Table}': could not attach to pipeline input '{Pipeline}' for replay — subscribing without it.", def.Name, name);
+                driver = null;
+                snapshot = null;
+            }
+        }
+
+        try
+        {
+            var handle = await stream.SubscribeAsync((batch, _) => OnPipelineBatchAsync(name, batch));
+            _pipelineSubs.Add(handle);
+
+            if (snapshot is not null && snapshot.Items.Count > 0)
+            {
+                if (snapshot.Truncated)
+                {
+                    ReplayInputs.WarnTruncated(logger, def.Name, name, snapshot.FirstSeq);
+                }
+
+                foreach (var batch in snapshot.Items)
+                {
+                    await OnPipelineBatchAsync(name, batch);
+                }
+            }
+        }
+        finally
+        {
+            if (driver is not null)
+            {
+                try { await driver.EndAttachAsync(); }
+                catch (Exception ex) { logger.LogDebug(ex, "Table '{Table}': releasing the attach hold on pipeline '{Pipeline}' failed; the pipeline's own safety timer covers it.", def.Name, name); }
+            }
+        }
 
         if (pipeline.Status != PipelineStatus.Running)
         {
