@@ -1,3 +1,8 @@
+using System.Text;
+using System.Text.Json;
+using StreamsForge.Abstractions;
+using StreamsForge.AppCore.Json;
+
 namespace StreamsForge.AppCore.Streaming;
 
 /// <summary>Plan 026 D6 — host-level defaults for the disk tier (<c>Replay:*</c> in configuration); a
@@ -39,9 +44,26 @@ public readonly record struct ReplaySegmentEntry(long Seq, long TimestampMs, lon
 /// <c>ReplaySegmentLogTests</c>.</para></summary>
 public sealed class ReplaySegmentLog : IDisposable
 {
+    /// <summary>The per-segment index built at open and maintained on rotate, so a read from a position can
+    /// skip whole segments without opening them.</summary>
+    private sealed class Segment
+    {
+        public required string Path { get; init; }
+        public required int Index { get; init; }
+        public long FirstSeq;
+        public long LastSeq;
+        public long NewestAtMs;
+        public long Length;
+    }
+
     private readonly string _directory;
     private readonly ReplayOptions _options;
     private readonly Func<long> _clock;
+    private readonly List<Segment> _segments = [];
+    private List<ReplaySegmentEntry> _buffer = [];
+    private long _lastSeq;
+    private bool _rotatePending;
+    private Task? _flush;
 
     /// <param name="directory">This stream's own directory (created if missing).</param>
     /// <param name="options">Effective limits for THIS stream (the caller has already applied the
@@ -52,37 +74,278 @@ public sealed class ReplaySegmentLog : IDisposable
         _directory = directory;
         _options = options;
         _clock = clock ?? (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-        throw new NotImplementedException("plan 026 wave 3 agent A");
+        System.IO.Directory.CreateDirectory(_directory);
+
+        var files = System.IO.Directory.GetFiles(_directory, "*.ndjson")
+            .OrderBy(f => f, StringComparer.Ordinal)
+            .ToList();
+
+        for (var i = 0; i < files.Count; i++)
+        {
+            var path = files[i];
+            if (i == files.Count - 1)
+            {
+                NormalizeTail(path);
+            }
+
+            if (new FileInfo(path).Length == 0)
+            {
+                File.Delete(path);
+                continue;
+            }
+
+            var first = Decode(FirstLine(path));
+            var last = Decode(LastLine(path));
+            if (first is null || last is null)
+            {
+                File.Delete(path);
+                continue;
+            }
+
+            _segments.Add(new Segment
+            {
+                Path = path,
+                Index = int.TryParse(Path.GetFileNameWithoutExtension(path), out var n) ? n : i,
+                FirstSeq = first.Value.Seq,
+                LastSeq = last.Value.Seq,
+                NewestAtMs = last.Value.AppendedAtMs,
+                Length = new FileInfo(path).Length,
+            });
+        }
+
+        _lastSeq = _segments.Count == 0 ? 0 : _segments[^1].LastSeq;
+        _rotatePending = _segments.Count > 0 && _segments[^1].Length >= _options.SegmentBytes;
     }
 
     public string Directory => _directory;
 
     /// <summary>Oldest retained position, or 0 when nothing is retained.</summary>
-    public long FirstSeq => throw new NotImplementedException("plan 026 wave 3 agent A");
+    public long FirstSeq => _segments.Count == 0 ? 0 : _segments[0].FirstSeq;
 
     /// <summary>Newest position ever written (recovered on open; advanced by <see cref="Append"/> even before
     /// the flush), or 0 when the directory is empty.</summary>
-    public long LastSeq => throw new NotImplementedException("plan 026 wave 3 agent A");
+    public long LastSeq => _lastSeq;
 
     /// <summary>Bytes on disk across retained segments (the buffered, unflushed tail excluded).</summary>
-    public long RetainedBytes => throw new NotImplementedException("plan 026 wave 3 agent A");
+    public long RetainedBytes => _segments.Sum(s => s.Length);
 
-    public int SegmentCount => throw new NotImplementedException("plan 026 wave 3 agent A");
+    public int SegmentCount => _segments.Count;
 
     /// <summary>Buffers one entry. <paramref name="seq"/> must be <c>LastSeq + 1</c>.</summary>
-    public void Append(long seq, long timestampMs, string payloadJson) =>
-        throw new NotImplementedException("plan 026 wave 3 agent A");
+    public void Append(long seq, long timestampMs, string payloadJson)
+    {
+        if (seq != _lastSeq + 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(seq), seq, $"replay positions are contiguous — expected {_lastSeq + 1}");
+        }
+
+        _buffer.Add(new ReplaySegmentEntry(seq, timestampMs, _clock(), payloadJson));
+        _lastSeq = seq;
+    }
 
     /// <summary>Writes the buffered tail, rotates when the current segment passed <c>SegmentBytes</c>, then
     /// applies age and byte retention. Single-flight: a call while one is in progress returns the same task.</summary>
-    public Task FlushAsync() => throw new NotImplementedException("plan 026 wave 3 agent A");
+    public Task FlushAsync() => _flush is { IsCompleted: false } ? _flush : _flush = FlushCoreAsync();
+
+    private async Task FlushCoreAsync()
+    {
+        // The swap happens BEFORE the first await, so an Append racing the write lands in the next flush's
+        // buffer rather than in a file this one already sized.
+        var pending = _buffer;
+        _buffer = [];
+
+        if (pending.Count > 0)
+        {
+            var sb = new StringBuilder();
+            foreach (var e in pending)
+            {
+                sb.Append("{\"seq\":").Append(e.Seq)
+                  .Append(",\"ts\":").Append(e.TimestampMs)
+                  .Append(",\"at\":").Append(e.AppendedAtMs)
+                  .Append(",\"payload\":").Append(e.PayloadJson)
+                  .Append("}\n");
+            }
+
+            var bytes = Encoding.UTF8.GetBytes(sb.ToString());
+
+            // Rotation is lazy — a new segment is only created when there is something to put in it, so
+            // SegmentCount always equals the number of files on disk (and survives a reopen).
+            if (_segments.Count == 0 || _rotatePending)
+            {
+                var index = _segments.Count == 0 ? 0 : _segments[^1].Index + 1;
+                _segments.Add(new Segment { Path = Path.Combine(_directory, $"{index:D6}.ndjson"), Index = index });
+                _rotatePending = false;
+            }
+
+            var seg = _segments[^1];
+            await using (var fs = new FileStream(seg.Path, FileMode.Append, FileAccess.Write))
+            {
+                await fs.WriteAsync(bytes);
+            }
+
+            if (seg.FirstSeq == 0)
+            {
+                seg.FirstSeq = pending[0].Seq;
+            }
+
+            seg.LastSeq = pending[^1].Seq;
+            seg.NewestAtMs = pending[^1].AppendedAtMs;
+            seg.Length += bytes.Length;
+            _rotatePending = seg.Length >= _options.SegmentBytes;
+        }
+
+        ApplyRetention();
+    }
 
     /// <summary>Every retained entry with <c>Seq &gt;= fromSeq</c>, oldest first, flushed AND buffered.</summary>
-    public IEnumerable<ReplaySegmentEntry> ReadFrom(long fromSeq) =>
-        throw new NotImplementedException("plan 026 wave 3 agent A");
+    public IEnumerable<ReplaySegmentEntry> ReadFrom(long fromSeq)
+    {
+        // Both tiers are snapshotted now: the caller may enumerate lazily across an Append or a Flush.
+        var paths = _segments.Where(s => s.LastSeq >= fromSeq).Select(s => s.Path).ToArray();
+        var buffered = _buffer.Where(e => e.Seq >= fromSeq).ToArray();
+        return Iterate();
+
+        IEnumerable<ReplaySegmentEntry> Iterate()
+        {
+            foreach (var path in paths)
+            {
+                foreach (var line in File.ReadLines(path))
+                {
+                    if (Decode(line) is { } e && e.Seq >= fromSeq)
+                    {
+                        yield return e;
+                    }
+                }
+            }
+
+            foreach (var e in buffered)
+            {
+                yield return e;
+            }
+        }
+    }
 
     public void Dispose()
     {
+    }
+
+    private void ApplyRetention()
+    {
+        var cutoff = _clock() - _options.RetainMs;
+        // Never the current (newest) segment: retention drops WHOLE closed segments only.
+        while (_segments.Count > 1)
+        {
+            var aged = _options.RetainMs > 0 && _segments[0].NewestAtMs < cutoff;
+            var overflowing = _options.MaxBytesPerStream > 0 && RetainedBytes > _options.MaxBytesPerStream;
+            if (!aged && !overflowing)
+            {
+                break;
+            }
+
+            File.Delete(_segments[0].Path);
+            _segments.RemoveAt(0);
+        }
+    }
+
+    private static ReplaySegmentEntry? Decode(string? line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            return new ReplaySegmentEntry(
+                root.GetProperty("seq").GetInt64(),
+                root.GetProperty("ts").GetInt64(),
+                root.GetProperty("at").GetInt64(),
+                root.GetProperty("payload").GetRawText());
+        }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            return null; // a torn or unparsable line is ignored on read, never an error
+        }
+    }
+
+    /// <summary>Drops a torn tail from the newest segment — an unterminated last line (a crash mid-write),
+    /// then any trailing line that does not parse — so the next append starts on a clean boundary.</summary>
+    private static void NormalizeTail(string path)
+    {
+        var bytes = File.ReadAllBytes(path);
+        var end = bytes.Length;
+        while (end > 0)
+        {
+            if (bytes[end - 1] != (byte)'\n')
+            {
+                end = LastNewlineBefore(bytes, end) + 1;
+                continue;
+            }
+
+            var start = LastNewlineBefore(bytes, end - 1) + 1;
+            if (Decode(Encoding.UTF8.GetString(bytes, start, end - 1 - start)) is not null)
+            {
+                break;
+            }
+
+            end = start;
+        }
+
+        if (end != bytes.Length)
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Write);
+            fs.SetLength(end);
+        }
+    }
+
+    private static int LastNewlineBefore(byte[] bytes, int exclusiveEnd)
+    {
+        for (var i = exclusiveEnd - 1; i >= 0; i--)
+        {
+            if (bytes[i] == (byte)'\n')
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static string? FirstLine(string path)
+    {
+        using var reader = new StreamReader(path, Encoding.UTF8);
+        return reader.ReadLine();
+    }
+
+    /// <summary>The last complete line, read from the tail rather than by scanning the whole segment.</summary>
+    private static string? LastLine(string path)
+    {
+        using var fs = File.OpenRead(path);
+        var chunk = 4096L;
+        while (true)
+        {
+            var start = Math.Max(0, fs.Length - chunk);
+            fs.Seek(start, SeekOrigin.Begin);
+            var buf = new byte[fs.Length - start];
+            fs.ReadExactly(buf);
+
+            var end = buf.Length;
+            while (end > 0 && (buf[end - 1] == (byte)'\n' || buf[end - 1] == (byte)'\r'))
+            {
+                end--;
+            }
+
+            var i = LastNewlineBefore(buf, end);
+            if (i >= 0 || start == 0)
+            {
+                return Encoding.UTF8.GetString(buf, i + 1, end - i - 1);
+            }
+
+            chunk *= 4;
+        }
     }
 }
 
@@ -90,10 +353,41 @@ public sealed class ReplaySegmentLog : IDisposable
 /// Rows are <c>Dictionary&lt;string, object?&gt;</c> holding only primitives (long/double/string/bool/null)
 /// — System.Text.Json reads those back as <c>JsonElement</c>, so <see cref="Deserialize{T}"/> MUST normalize
 /// every value to the primitive the Engine expects (reuse the normalizer the connector formats already
-/// have under <c>Connectors/Mapping</c> if it fits). Pinned by the orchestrator; agent A implements.</summary>
+/// have under <c>Connectors/Mapping</c> if it fits). Pinned by the orchestrator; agent A implements.
+///
+/// <para>One lossy edge, inherent to JSON and not worth a type tag: a <c>double</c> whose value is integral
+/// (<c>2.0</c>) is written as <c>2</c> and read back as <c>long</c>. Fractional doubles round-trip.</para></summary>
 public static class ReplayPayloadJson
 {
-    public static string Serialize<T>(T item) => throw new NotImplementedException("plan 026 wave 3 agent A");
+    private static readonly JsonSerializerOptions Options = new();
 
-    public static T Deserialize<T>(string json) => throw new NotImplementedException("plan 026 wave 3 agent A");
+    public static string Serialize<T>(T item) => JsonSerializer.Serialize(item, Options);
+
+    public static T Deserialize<T>(string json)
+    {
+        var value = JsonSerializer.Deserialize<T>(json, Options)!;
+        switch (value)
+        {
+            // EventRecord IS a Dictionary<string, object?>, so it lands in this case too.
+            case Dictionary<string, object?> row:
+                JsonValueNormalizer.NormalizeInPlace(row);
+                break;
+            case IEnumerable<ResultEnvelope> results:
+                foreach (var r in results)
+                {
+                    JsonValueNormalizer.NormalizeInPlace(r.Row);
+                }
+
+                break;
+            case IEnumerable<TableDeltaDto> deltas:
+                foreach (var d in deltas)
+                {
+                    JsonValueNormalizer.NormalizeInPlace(d.Row);
+                }
+
+                break;
+        }
+
+        return value;
+    }
 }
