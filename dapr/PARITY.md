@@ -292,6 +292,26 @@ Plan 014 database connectors, 015 entitlements/approvals/audit (`AccessPolicyAct
 019 `fix-duplex`, 021 environments (`EnvironmentRegistryActor`, `CatalogFacadeFactory`). All wired in
 `dapr/src/StreamsForge.Dapr.Host/Program.cs`. Present is not the same as verified — see section 3.
 
+## 2b. Open debt — plan 026 (stream replay), Orleans-first by design
+
+### D11 · Replay from a position — OPEN (plan 026 wave 1, 2026-09-14)
+
+Orleans wave 1 gave every source driver (connector, generator, ingest) a producer-owned,
+sequence-numbered replay log behind the plan 023 attach gate (`SourceReplayGate` over the shared
+`ReplayLog<T>` in `shared/StreamsForge.AppCore/Streaming/`), and `IEntityStreamFacade` a replaying
+overload (`SubscribeSourceAsync(env, name, ReplayFrom? from, onEvent(row, ts, position))`) that gRPC
+`SubscribeSource{from_seq|from_timestamp_ms}` and the hub's `SubscribeSourceFrom` use. On Dapr,
+`EntityStreamFanout` implements the overload by ACCEPTING AND IGNORING `from`: positions are counted
+per subscription from 1, and the handle reports `Truncated` whenever a replay was actually asked for,
+so a client is told rather than silently given live-only. `ConnectorActor` still uses plan 023's
+`SourceReplayBuffer` (count-only ring, no positions). Closing this = switch the three Dapr drivers to
+`ReplayLog`, add `ReplayFrom` to `IConnectorActor.BeginAttachAsync`, and route the fan-out through
+the gate; the log and the wire contract are already shared, so it is wiring, not design. Later plan
+026 waves (pipeline/table logs, the persisted segment log, `replayFrom` on definitions) will add a
+line each here.
+
+---
+
 ---
 
 ## 3. Unverified — the honest state of every "verified live on Dapr" claim

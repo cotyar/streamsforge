@@ -1,6 +1,6 @@
 # 026 — Stream replay: subscribe from a position in the past, on any persistence mode
 
-Status: **PLANNED** (2026-09-14). Orleans first; Dapr gets a PARITY line per wave and its own port later.
+Status: **wave 1 DONE on Orleans** (2026-09-14); waves 2–4 planned. Dapr gets a PARITY line per wave and its own port later (`dapr/PARITY.md` § 2b D11).
 
 ## Why
 
@@ -136,6 +136,45 @@ Acceptance:
   rule, the truncation flag), `orleans/ARCHITECTURE.md`, `TRANSPORTS.md` (a transport author gets the
   log for free through `PublishAsync`), `CLAUDE.md` paragraph + ports, `dapr/PARITY.md` (one line per
   wave), `PushStreamProvider` comment fix (D9).
+
+## Outcomes
+
+### Wave 1 (2026-09-14; orchestrator pre-wave `caa32ac`, agent A `e39f0dd`, agent B `9e6a918`, merge `380aba2`)
+
+- **Pre-wave (orchestrator).** `ReplayFrom` (Contracts), `ReplayLog<T>` (AppCore, 6 unit tests: seq
+  monotonic from 1, exact seq/timestamp boundaries, count eviction with honest `Truncated`, age
+  eviction on the WALL clock — an ingest row with a days-old `_ts` must not be evicted on arrival —
+  empty log reads `FirstSeq == LastSeq + 1`, copies both ways). `SourceReplayGate` (Host) is plan
+  023's private gate lifted verbatim out of `ConnectorGrain` and now shared by `ConnectorGrain`,
+  `GeneratorGrain` and the new `IngestSourceGrain`. `IReplayableSourceGrain` (Abstractions) with
+  `BeginAttachAsync(ReplayFrom?)`; `SourceReplaySnapshot` gained `Positions/FirstSeq/LastSeq/Truncated`
+  additively; `IEntityStreamFacade` gained the replaying overload + `IEntityReplaySubscription`; proto
+  `from_seq`/`from_timestamp_ms`/`position`/`replay_truncated` (server + TS + Kotlin copies). Found:
+  Orleans' codegen refuses `init` setters on a `[GenerateSerializer]` record (`ORLEANS0101`) — plain
+  `set`. Verified by IL that `MemoryAdapterFactory.IsRewindable` is true; the wrong sentence in
+  `PushStreamProvider` is fixed (D9).
+- **Agent A** — `IngestSourceGrain` (D3) + `OrleansIngressFacade.DrainAsync` now one grain call per
+  batch; `SourceReplayFromClusterTests` (file source: exactly 100 rows from seq 401, positions
+  401..500, `FirstSeq 1 / LastSeq 500 / Truncated false`; a timestamp request returns nothing older;
+  the parameterless attach still returns all 500; generator: exactly the last 50 by position; ingest:
+  1 000 pushed through the real `IIngressFacade`, 1 000 in the table, `DownstreamDropped == 0`, then
+  exactly 100 from seq 901).
+- **Agent B** — `OrleansEntityStreamFacade` replaying overload (kind-dispatched driver grain, Begin →
+  subscribe → feed → End in `finally`; `from == null` skips the gate; crdt/unknown → `NotSupported`);
+  gRPC `SubscribeSource` writes `position` on EVERY event now (also the pre-026 live-only path) and
+  buffers until the facade returns so `replay_truncated` can sit on the first event; hub
+  `SubscribeSourceFrom(name, fromSeq?, fromTimestampMs?)` (new name — hubs cannot overload) replays to
+  the caller then joins the group, hand-off documented as best-effort. `SourceReplayGrpcTests` (6):
+  replay-then-live with consecutive positions, two subscribers agree on `position` per row, gRPC
+  position + truncation (10 005-row file → first event `Truncated`, `Position == 6`), crdt-kind →
+  `FailedPrecondition`, hub replay then one group join.
+- **Not done in this wave, by decision:** tables/pipelines still attach to generator/ingest sources
+  WITHOUT the gate (a new table over a seeded generator must not suddenly receive 10 000 historical
+  rows) — `replayFrom` on the definition (wave 2, D5) is the opt-in. SignalR live tape carries no
+  `position` (wave 4). Positions restart at 1 per activation (wave 3).
+- **Live positions are counted, not stamped** (`LastSeq + n` from the attach snapshot): exact except
+  inside plan 023's ~one-pull-period window where a queued row is delivered live AND replayed, so the
+  tests quiesce 2 s before attaching. Stamping positions on the wire is the upgrade path.
 
 ## Gates (every wave)
 
