@@ -35,7 +35,12 @@ namespace StreamsForge.Host.Facades;
 /// was (StreamGrpcService.WaitForCancellationThenUnsubscribeAsync), so this class cannot silently hide a
 /// failure the caller decided to tolerate.</para>
 /// </summary>
-internal sealed class OrleansEntityStreamFacade(IClusterClient client) : IEntityStreamFacade
+// Public, unlike the rest of this Facades/ directory, for the same reason GrpcEntityRef is (see that
+// class's own comment): the Host test project has no InternalsVisibleTo, and
+// SourceReplayGrpcTests constructs this directly over a TestCluster's IClusterClient rather than
+// through DI. Adding an InternalsVisibleTo to the whole assembly to keep one class internal is the
+// more expensive of the two options.
+public sealed class OrleansEntityStreamFacade(IClusterClient client) : IEntityStreamFacade
 {
     public async Task<IAsyncDisposable> SubscribeSourceAsync(
         string environment, string sourceName, Func<IReadOnlyDictionary<string, object?>, long, Task> onEvent)
@@ -49,13 +54,90 @@ internal sealed class OrleansEntityStreamFacade(IClusterClient client) : IEntity
         return new Handle<EventRecord>(await stream.SubscribeAsync((evt, _) => onEvent(evt, evt.Timestamp)));
     }
 
-    /// <summary>Plan 026 wave 1 — STUB pinned by the orchestrator so both hosts build; wave 1 agent B
-    /// replaces it with the gated implementation (BeginAttachAsync(from) on the source's driver grain →
-    /// subscribe → replay → EndAttachAsync, positions continuing from LastSeq).</summary>
-    public Task<IEntityReplaySubscription> SubscribeSourceAsync(
+    /// <summary>Plan 026 wave 1 — the replaying half of <see cref="IEntityStreamFacade.SubscribeSourceAsync(string, string, ReplayFrom?, Func{IReadOnlyDictionary{string, object?}, long, long, Task})"/>,
+    /// implementing plan 023's attach protocol verbatim (see <see cref="IConnectorGrain.BeginAttachAsync()"/>'s
+    /// long doc for why the order below is correct and exactly-once): resolve the source's driver grain by
+    /// kind, <c>BeginAttachAsync(from)</c> → subscribe to its stream → feed the snapshot through the SAME
+    /// handler the live subscription uses → <c>EndAttachAsync</c> in a <c>finally</c>. The snapshot is fully
+    /// delivered BEFORE this method returns — <see cref="StreamsForge.Api.Hubs.StreamHub.SubscribeSourceFrom"/>
+    /// and <see cref="StreamsForge.Host.Grpc.StreamGrpcService"/> both rely on that to know when to stop
+    /// treating callbacks as "replay" and start treating them as "live".
+    ///
+    /// <para><c>from == null</c> skips the gate entirely (nothing to replay) and subscribes live only —
+    /// byte-identical to the older <see cref="SubscribeSourceAsync(string, string, Func{IReadOnlyDictionary{string, object?}, long, Task})"/>
+    /// overload, just with a per-subscription position counted from 1 attached to every callback and a
+    /// handle reporting <c>FirstSeq=1/LastSeq=0/Truncated=false</c> (there was nothing to retain-and-report
+    /// because nothing was asked for).</para>
+    ///
+    /// <para>A <c>crdt</c>-kind source refuses with <see cref="NotSupportedException"/> — CRDT documents
+    /// have their own replay (plan 020's <c>ReplayAsync</c>), never this log. A source the catalog does not
+    /// know at all also refuses: unlike the plain <see cref="SubscribeSourceAsync(string, string, Func{IReadOnlyDictionary{string, object?}, long, Task})"/>
+    /// overload (which has always tolerated subscribing before an entity exists), asking for a POSITION
+    /// needs a driver grain to ask, and there is no way to pick one for a kind nobody has declared yet.</para>
+    ///
+    /// <para><b>ponytail: the one known drift, from plan 023's "ONE GAP, MEASURED" paragraph on
+    /// <see cref="IConnectorGrain.BeginAttachAsync()"/>.</b> The attach hold stops the driver PUBLISHING;
+    /// it has no reach into the stream provider's own delivery pipeline. A row already handed to
+    /// <c>OnNextAsync</c> may still be sitting in the memory stream's queue, not yet pulled into the cache
+    /// a brand-new subscriber is served from (default pull period 100 ms) — so a subscription that lands
+    /// inside that window can receive such a row live AND see it in the replayed snapshot, with live
+    /// positions then running one ahead of what the wire eventually settles on. Positions for live rows
+    /// are counted locally from <c>snapshot.LastSeq</c> rather than stamped by the producer at publish
+    /// time, which is the actual fix and the upgrade path once it is worth taking.</para></summary>
+    public async Task<IEntityReplaySubscription> SubscribeSourceAsync(
         string environment, string sourceName, ReplayFrom? from,
-        Func<IReadOnlyDictionary<string, object?>, long, long, Task> onEvent) =>
-        throw new NotImplementedException("plan 026 wave 1 agent B");
+        Func<IReadOnlyDictionary<string, object?>, long, long, Task> onEvent)
+    {
+        var qualified = EnvKeys.Qualify(environment, sourceName);
+        var stream = client.GetStreamProvider(StreamConstants.ProviderName)
+            .GetStream<EventRecord>(StreamId.Create(StreamConstants.SourcesNamespace, qualified));
+
+        if (from is null)
+        {
+            long live = 0;
+            var liveHandle = await stream.SubscribeAsync((evt, _) => onEvent(evt, evt.Timestamp, ++live));
+            return new ReplaySubscriptionHandle(new Handle<EventRecord>(liveHandle), firstSeq: 1, lastSeq: 0, truncated: false);
+        }
+
+        var def = await client.RegistryFor(environment).GetSourceAsync(sourceName)
+            ?? throw new NotSupportedException(
+                $"source '{sourceName}' is not in the catalog — replay needs a driver grain to ask, and there is no kind to resolve one for");
+
+        var kind = SourceKindDispatch.Classify(def.Kind);
+        IReplayableSourceGrain grain = kind switch
+        {
+            SourceKindDispatch.ActorKind.Connector => client.GetGrain<IConnectorGrain>(qualified),
+            SourceKindDispatch.ActorKind.Generator => client.GetGrain<IGeneratorGrain>(qualified),
+            SourceKindDispatch.ActorKind.Ingest => client.GetGrain<IIngestSourceGrain>(qualified),
+            SourceKindDispatch.ActorKind.Crdt => throw new NotSupportedException(
+                $"source '{sourceName}' is crdt-kind — it has its own replay (plan 020's ReplayAsync), not this one"),
+            _ => throw new NotSupportedException($"source '{sourceName}' has an unrecognized kind '{def.Kind}'"),
+        };
+
+        var snapshot = await grain.BeginAttachAsync(from);
+        try
+        {
+            long live = 0;
+            var handle = await stream.SubscribeAsync((evt, _) =>
+                onEvent(evt, evt.Timestamp, snapshot.LastSeq + ++live));
+
+            for (var i = 0; i < snapshot.Rows.Count; i++)
+            {
+                var row = snapshot.Rows[i];
+                var ts = row.TryGetValue(EventRecord.TimestampField, out var v) && v is long l ? l : 0L;
+                await onEvent(row, ts, snapshot.Positions[i]);
+            }
+
+            return new ReplaySubscriptionHandle(new Handle<EventRecord>(handle), snapshot.FirstSeq, snapshot.LastSeq, snapshot.Truncated);
+        }
+        finally
+        {
+            // Begin succeeded (we are past it), so the hold IS ours to drop — always release it, even if
+            // subscribing or feeding the snapshot above threw, or the deferred rows the gate queued behind
+            // this hold would never be flushed.
+            await grain.EndAttachAsync();
+        }
+    }
 
     public async Task<IAsyncDisposable> SubscribePipelineAsync(
         string environment, string pipelineId, Func<IReadOnlyList<ResultEnvelope>, Task> onResults)
@@ -80,5 +162,18 @@ internal sealed class OrleansEntityStreamFacade(IClusterClient client) : IEntity
     private sealed class Handle<T>(StreamSubscriptionHandle<T> handle) : IAsyncDisposable
     {
         public async ValueTask DisposeAsync() => await handle.UnsubscribeAsync();
+    }
+
+    /// <summary>Plan 026 wave 1 — wraps the underlying stream <see cref="IAsyncDisposable"/> with the
+    /// replay bookkeeping <see cref="IEntityReplaySubscription"/> promises. Disposing unsubscribes exactly
+    /// the stream subscription, same as <see cref="Handle{T}"/>.</summary>
+    private sealed class ReplaySubscriptionHandle(IAsyncDisposable inner, long firstSeq, long lastSeq, bool truncated)
+        : IEntityReplaySubscription
+    {
+        public long FirstSeq { get; } = firstSeq;
+        public long LastSeq { get; } = lastSeq;
+        public bool Truncated { get; } = truncated;
+
+        public async ValueTask DisposeAsync() => await inner.DisposeAsync();
     }
 }

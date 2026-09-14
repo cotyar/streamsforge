@@ -55,7 +55,8 @@ public class StreamHubAwarenessTests
         var clients = new RecordingClients();
         var hub = new StreamHub(
             new AccessGuard(resolver, entitlementsEnabled: true),
-            new TestServiceProvider(new StubCatalog(sources), registry))
+            new TestServiceProvider(new StubCatalog(sources), registry),
+            new NullEntityStreamFacade())
         {
             Context = new FakeCallerContext(user, connectionId),
             Groups = groups,
@@ -172,7 +173,8 @@ public class StreamHubAwarenessTests
         // A second CONNECTION (same registry, same document, different connectionId) hits the cap.
         var hub2 = new StreamHub(
             new AccessGuard(new PermissionResolver(new CountingAccessPolicyFacade(document), NullLogger<PermissionResolver>.Instance, 600), entitlementsEnabled: true),
-            new TestServiceProvider(new StubCatalog([source]), registry))
+            new TestServiceProvider(new StubCatalog([source]), registry),
+            new NullEntityStreamFacade())
         {
             Context = new FakeCallerContext(PermissionResolverTests.Principal("alice"), "conn-2"),
             Groups = new RecordingGroups(),
@@ -223,7 +225,8 @@ public class StreamHubAwarenessTests
         now = now.AddSeconds(3);
         var hubB = new StreamHub(
             new AccessGuard(new PermissionResolver(new CountingAccessPolicyFacade(document), NullLogger<PermissionResolver>.Instance, 600), entitlementsEnabled: true),
-            new TestServiceProvider(new StubCatalog([source]), registry))
+            new TestServiceProvider(new StubCatalog([source]), registry),
+            new NullEntityStreamFacade())
         {
             Context = new FakeCallerContext(PermissionResolverTests.Principal("bob"), "conn-b"),
             Groups = new RecordingGroups(),
@@ -320,6 +323,29 @@ public class StreamHubAwarenessTests
         public Task<TableDefinition?> SetTableStatusAsync(string id, PipelineStatus status) => throw new NotImplementedException();
         public Task<string> EnsureFieldNumbersAsync(string entityKey, List<FieldDef> fields) => throw new NotImplementedException();
         public Task<ScenarioRunResult> RunSourceAsync(string name, ScenarioRunRequest request) => throw new NotImplementedException();
+    }
+
+    /// <summary>Plan 026 wave 1 — <see cref="StreamHub"/>'s new required <see cref="IEntityStreamFacade"/>
+    /// dependency, unused by every test in this file (none of them call <c>SubscribeSourceFrom</c>): every
+    /// member throws, so an accidental call is loud rather than silently returning nothing.</summary>
+    private sealed class NullEntityStreamFacade : IEntityStreamFacade
+    {
+        public Task<IAsyncDisposable> SubscribeSourceAsync(
+            string environment, string sourceName, Func<IReadOnlyDictionary<string, object?>, long, Task> onEvent) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IEntityReplaySubscription> SubscribeSourceAsync(
+            string environment, string sourceName, ReplayFrom? from,
+            Func<IReadOnlyDictionary<string, object?>, long, long, Task> onEvent) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IAsyncDisposable> SubscribePipelineAsync(
+            string environment, string pipelineId, Func<IReadOnlyList<ResultEnvelope>, Task> onResults) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IAsyncDisposable> SubscribeTableAsync(
+            string environment, string tableName, Func<IReadOnlyList<TableDeltaDto>, Task> onDeltas) =>
+            throw new NotImplementedException("not exercised by this test");
     }
 
     private sealed class RecordingGroups : IGroupManager

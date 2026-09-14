@@ -62,7 +62,8 @@ public class StreamHubEntitlementTests
                 [
                     new TableDefinition { Id = "t-fin", Name = "positions", Tags = ["finance"] },
                     new TableDefinition { Id = "t-hr", Name = "salaries", Tags = ["hr"] },
-                ])))
+                ])),
+            new NullEntityStreamFacade())
         {
             Context = new FakeCallerContext(user),
             Groups = groups,
@@ -177,7 +178,7 @@ public class StreamHubEntitlementTests
         var resolver = new PermissionResolver(
             new CountingAccessPolicyFacade(Document()), NullLogger<PermissionResolver>.Instance, 600);
         var groups = new RecordingGroups();
-        var hub = new StreamHub(new AccessGuard(resolver, entitlementsEnabled: false), new SingleCatalogServiceProvider(new StubCatalog([], [], [])))
+        var hub = new StreamHub(new AccessGuard(resolver, entitlementsEnabled: false), new SingleCatalogServiceProvider(new StubCatalog([], [], [])), new NullEntityStreamFacade())
         {
             Context = new FakeCallerContext(PermissionResolverTests.Principal("mallory")),
             Groups = groups,
@@ -192,6 +193,29 @@ public class StreamHubEntitlementTests
     // ---------------------------------------------------------------------------------------------
     // Fakes
     // ---------------------------------------------------------------------------------------------
+
+    /// <summary>Plan 026 wave 1 — <see cref="StreamHub"/>'s new required <see cref="IEntityStreamFacade"/>
+    /// dependency, unused by every test in this file (none of them call <c>SubscribeSourceFrom</c>): every
+    /// member throws, so an accidental call is loud rather than silently returning nothing.</summary>
+    private sealed class NullEntityStreamFacade : IEntityStreamFacade
+    {
+        public Task<IAsyncDisposable> SubscribeSourceAsync(
+            string environment, string sourceName, Func<IReadOnlyDictionary<string, object?>, long, Task> onEvent) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IEntityReplaySubscription> SubscribeSourceAsync(
+            string environment, string sourceName, ReplayFrom? from,
+            Func<IReadOnlyDictionary<string, object?>, long, long, Task> onEvent) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IAsyncDisposable> SubscribePipelineAsync(
+            string environment, string pipelineId, Func<IReadOnlyList<ResultEnvelope>, Task> onResults) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IAsyncDisposable> SubscribeTableAsync(
+            string environment, string tableName, Func<IReadOnlyList<TableDeltaDto>, Task> onDeltas) =>
+            throw new NotImplementedException("not exercised by this test");
+    }
 
     private sealed class RecordingGroups : IGroupManager
     {
