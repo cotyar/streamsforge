@@ -126,6 +126,54 @@ public sealed class StreamHub(AccessGuard guard, IServiceProvider services, IEnt
     public Task UnsubscribePipeline(string id) =>
         Groups.RemoveFromGroupAsync(Context.ConnectionId, $"pipeline:{EnvKeys.Qualify(ConnectionEnv, id)}");
 
+    /// <summary>Plan 026 wave 2 — <see cref="SubscribePipeline"/>'s replaying twin, mirroring
+    /// <see cref="SubscribeSourceFrom"/>'s shape exactly (new method name for the same reason: SignalR
+    /// hubs cannot overload). Retained result batches matching <paramref name="fromSeq"/>/
+    /// <paramref name="fromTimestampMs"/> (seq wins; neither set means live only) are sent to
+    /// <em>this caller only</em> as the SAME <c>pipelineResult(pipelineId, rows)</c> shape
+    /// <c>StreamBridgeService</c>/<c>DaprStreamBridge</c> relay to the <c>pipeline:</c> group, plus a
+    /// trailing <c>position</c> argument (the batch's producer position — every row in <c>rows</c> shares
+    /// it, same as gRPC's <see cref="StreamsForge.Host.Grpc.V1.ResultEnvelope.Position"/>). Once the facade
+    /// call returns, this connection stops receiving batches directly and joins the ordinary
+    /// <c>pipeline:</c> group instead. The hand-off is best-effort — see <see cref="SubscribeSourceFrom"/>'s
+    /// own note, identical here.</summary>
+    public async Task SubscribePipelineFrom(string id, long? fromSeq, long? fromTimestampMs)
+    {
+        var subscribed = await ReadCatalogAsync(c => c.GetPipelineAsync(id));
+        await EnsureAsync(Actions.PipelineRead, id, subscribed?.Tags);
+
+        var pipelineId = subscribed?.Id ?? id;
+        var environment = subscribed?.Environment ?? ConnectionEnv;
+
+        ReplayFrom? from = fromSeq is { } seq
+            ? new ReplayFrom { Seq = seq }
+            : fromTimestampMs is { } ts
+                ? new ReplayFrom { TimestampMs = ts }
+                : null;
+
+        var replaying = true;
+        IEntityReplaySubscription handle;
+        try
+        {
+            handle = await streams.SubscribePipelineAsync(environment, pipelineId, from, async (rows, position) =>
+            {
+                if (!replaying)
+                {
+                    return;
+                }
+                await Clients.Caller.SendAsync("pipelineResult", id, rows, position);
+            });
+        }
+        catch (NotSupportedException ex)
+        {
+            throw new HubException(ex.Message);
+        }
+
+        replaying = false;
+        await handle.DisposeAsync();
+        await Groups.AddToGroupAsync(Context.ConnectionId, $"pipeline:{EnvKeys.Qualify(ConnectionEnv, id)}");
+    }
+
     public async Task SubscribeSource(string name)
     {
         await EnsureAsync(Actions.SourceRead, name, (await ReadCatalogAsync(c => c.GetSourceAsync(name)))?.Tags);
@@ -248,6 +296,61 @@ public sealed class StreamHub(AccessGuard guard, IServiceProvider services, IEnt
 
     public Task UnsubscribeTable(string name) =>
         Groups.RemoveFromGroupAsync(Context.ConnectionId, $"table:{EnvKeys.Qualify(ConnectionEnv, name)}");
+
+    /// <summary>Plan 026 wave 2 — <see cref="SubscribeTable"/>'s replaying twin, mirroring
+    /// <see cref="SubscribeSourceFrom"/>'s shape (new method name; SignalR hubs cannot overload). Same
+    /// id-or-name resolution <see cref="SubscribeTable"/> does — the group and the direct sends both use
+    /// the RESOLVED name. Retained delta batches matching <paramref name="fromSeq"/>/
+    /// <paramref name="fromTimestampMs"/> (seq wins; neither set means live only) are sent to
+    /// <em>this caller only</em> as the SAME <c>tableDelta(tableName, deltas, seq)</c> shape
+    /// <c>StreamBridgeService</c>/<c>DaprStreamBridge</c> relay to the <c>table:</c> group — <c>seq</c> here
+    /// is this call's own per-subscription batch counter, not the bridge's netted-flush one — plus a
+    /// trailing <c>position</c> argument (the batch's producer position). Once the facade call returns,
+    /// this connection joins the ordinary <c>table:</c> group. The hand-off is best-effort — see
+    /// <see cref="SubscribeSourceFrom"/>'s own note, identical here.</summary>
+    public async Task SubscribeTableFrom(string idOrName, long? fromSeq, long? fromTimestampMs)
+    {
+        var hit = EntityRef.Resolve(await ReadCatalogAsync(c => c.GetTablesAsync()), idOrName);
+        var name = hit.Value?.Name ?? idOrName;
+
+        await EnsureAsync(Actions.TableRead, name, hit.Value?.Tags);
+
+        if (hit.Outcome == EntityRefOutcome.Ambiguous)
+        {
+            throw new HubException(hit.Message);
+        }
+
+        var environment = hit.Value?.Environment ?? ConnectionEnv;
+
+        ReplayFrom? from = fromSeq is { } seq
+            ? new ReplayFrom { Seq = seq }
+            : fromTimestampMs is { } ts
+                ? new ReplayFrom { TimestampMs = ts }
+                : null;
+
+        var replaying = true;
+        long batchSeq = 0;
+        IEntityReplaySubscription handle;
+        try
+        {
+            handle = await streams.SubscribeTableAsync(environment, name, from, async (deltas, position) =>
+            {
+                if (!replaying)
+                {
+                    return;
+                }
+                await Clients.Caller.SendAsync("tableDelta", name, deltas, ++batchSeq, position);
+            });
+        }
+        catch (NotSupportedException ex)
+        {
+            throw new HubException(ex.Message);
+        }
+
+        replaying = false;
+        await handle.DisposeAsync();
+        await Groups.AddToGroupAsync(Context.ConnectionId, $"table:{EnvKeys.Qualify(ConnectionEnv, name)}");
+    }
 
     // -------------------------------------------------------------------------------------------------
     // Plan 020 wave G — awareness. See this class's own remarks for the authorization rule and
