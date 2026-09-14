@@ -81,7 +81,7 @@ namespace StreamsForge.Api.Hubs;
 /// platform.</para>
 /// </summary>
 [Authorize(Policy = "Viewer")]
-public sealed class StreamHub(AccessGuard guard, IServiceProvider services) : Hub
+public sealed class StreamHub(AccessGuard guard, IServiceProvider services, IEntityStreamFacade streams) : Hub
 {
     /// <summary>The environment this connection selected, read off the HTTP request that established it
     /// — see the class remarks. A connection whose <c>HttpContext</c> somehow never reached
@@ -134,6 +134,64 @@ public sealed class StreamHub(AccessGuard guard, IServiceProvider services) : Hu
 
     public Task UnsubscribeSource(string name) =>
         Groups.RemoveFromGroupAsync(Context.ConnectionId, $"source:{EnvKeys.Qualify(ConnectionEnv, name)}");
+
+    /// <summary>Plan 026 wave 1 — <see cref="SubscribeSource"/>'s replaying twin. A NEW method name because
+    /// SignalR hubs cannot overload: a second <c>SubscribeSource</c> taking extra parameters would silently
+    /// shadow rather than overload. <paramref name="fromSeq"/>/<paramref name="fromTimestampMs"/> mirror
+    /// gRPC's <c>from_seq</c>/<c>from_timestamp_ms</c> (seq wins when both are set; neither set means "live
+    /// only", same as calling <see cref="SubscribeSource"/>).
+    ///
+    /// <para>Retained events matching the request are sent to <em>this caller only</em> — not the group,
+    /// which nobody but this connection asked to replay — as the SAME <c>sourceEvent</c> shape
+    /// <c>StreamBridgeService</c>/<c>DaprStreamBridge</c> relay to the <c>source:</c> group (bare source
+    /// name, the row, unchanged), plus a third argument carrying the producer <c>position</c>. Once the
+    /// facade call returns — which happens only after every retained event has been sent (see
+    /// <see cref="IEntityStreamFacade.SubscribeSourceAsync(string, string, ReplayFrom?, Func{IReadOnlyDictionary{string, object?}, long, long, Task})"/>'s
+    /// own contract) — this connection stops being sent events directly and joins the ordinary
+    /// <c>source:</c> group instead, exactly like <see cref="SubscribeSource"/> does, so it keeps receiving
+    /// live rows for as long as it stays subscribed.</para>
+    ///
+    /// <para><b>The hand-off is best-effort, not exact.</b> There is a window between disposing this
+    /// call's own subscription and joining the group during which a live row published by the source is
+    /// relayed to nobody — the bridge's group-based relay was not joined yet, and this call's direct
+    /// subscription was already torn down. Closing it would need joining the group BEFORE disposing (which
+    /// risks the opposite: the same row delivered twice, once directly and once through the group) or a
+    /// sequenced hand-off the bridge does not support today. gRPC's <c>SubscribeSource</c> has no such gap
+    /// — one subscription serves the whole call, replay and live alike — so a caller that cannot tolerate
+    /// the gap should prefer that transport. <c>// ponytail: bridge-side positions (a `position` field on
+    /// the ordinary group relay, not just this replay call) are wave 4 (console) work.</c></para></summary>
+    public async Task SubscribeSourceFrom(string name, long? fromSeq, long? fromTimestampMs)
+    {
+        await EnsureAsync(Actions.SourceRead, name, (await ReadCatalogAsync(c => c.GetSourceAsync(name)))?.Tags);
+
+        ReplayFrom? from = fromSeq is { } seq
+            ? new ReplayFrom { Seq = seq }
+            : fromTimestampMs is { } ts
+                ? new ReplayFrom { TimestampMs = ts }
+                : null;
+
+        var replaying = true;
+        IEntityReplaySubscription handle;
+        try
+        {
+            handle = await streams.SubscribeSourceAsync(ConnectionEnv, name, from, async (row, tsMs, position) =>
+            {
+                if (!replaying)
+                {
+                    return;
+                }
+                await Clients.Caller.SendAsync("sourceEvent", name, row, position);
+            });
+        }
+        catch (NotSupportedException ex)
+        {
+            throw new HubException(ex.Message);
+        }
+
+        replaying = false;
+        await handle.DisposeAsync();
+        await Groups.AddToGroupAsync(Context.ConnectionId, $"source:{EnvKeys.Qualify(ConnectionEnv, name)}");
+    }
 
     /// <summary>The metrics group is cluster-wide and names no entity, so it asks
     /// <see cref="Actions.CatalogRead"/> at <c>*</c> — the action the wave-1 equivalence matrix already

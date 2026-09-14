@@ -4,6 +4,7 @@ using StreamsForge.Abstractions;
 using StreamsForge.AppCore.Environments;
 using StreamsForge.Api.Auth;
 using StreamsForge.AppCore;
+using System.Threading;
 using V1 = StreamsForge.Host.Grpc.V1;
 
 namespace StreamsForge.Host.Grpc;
@@ -36,6 +37,26 @@ public sealed class StreamGrpcService(ICatalogFacade catalog, IEntityStreamFacad
     // scoped catalog the removed `client.RegistryFor(EnvironmentAmbient.Current)` property produced.
     private ICatalogFacade Registry => catalog;
 
+    /// <summary>Plan 026 wave 1 — now always goes through <see cref="IEntityStreamFacade"/>'s replaying
+    /// overload (with <c>from: null</c> when neither request field is set), so <c>Position</c> is written
+    /// on every event including the pre-026 live-only path; <c>Seq</c> stays the per-subscription counter
+    /// it always was, so nothing an existing client asserts on changes.
+    ///
+    /// <para><b>Buffering, and why.</b> The facade's replaying overload feeds the ENTIRE retained snapshot
+    /// through this callback before it returns the subscription handle (see
+    /// <c>OrleansEntityStreamFacade.SubscribeSourceAsync</c>'s own doc) — so at the moment the first
+    /// replayed row arrives, <c>handle.Truncated</c> (needed for <see cref="V1.SourceEvent.ReplayTruncated"/>
+    /// on the FIRST event) is not known yet, and it must not be known: writing untruncated-or-not before
+    /// the whole snapshot is accounted for would be guessing. Every event is therefore buffered under
+    /// <c>writeGate</c> until the awaited call returns and the flag is known, then flushed in the order it
+    /// arrived (a live row that races the handoff and gets buffered too is written in its correct position,
+    /// not out of order) — after which the callback writes straight through. <c>writeGate</c> also
+    /// serializes every write against <see cref="IServerStreamWriter{T}.WriteAsync"/>'s own "no concurrent
+    /// calls" rule, which the buffer-vs-direct-write split would otherwise be free to violate.</para>
+    ///
+    /// <para>A <see cref="NotSupportedException"/> from the facade (a <c>crdt</c>-kind or unknown source
+    /// asked to replay from a position) becomes <see cref="StatusCode.FailedPrecondition"/> — the caller
+    /// asked for something this source cannot do, not a not-found or a permission problem.</para></summary>
     [Authorize(Policy = "Viewer")]
     public override async Task SubscribeSource(
         V1.SubscribeSourceRequest request,
@@ -46,19 +67,83 @@ public sealed class StreamGrpcService(ICatalogFacade catalog, IEntityStreamFacad
             guard, context, Actions.SourceRead, request.Name,
             (await Registry.GetSourceAsync(request.Name))?.Tags);
 
+        ReplayFrom? from = request.FromSeq > 0
+            ? new ReplayFrom { Seq = request.FromSeq }
+            : request.FromTimestampMs > 0
+                ? new ReplayFrom { TimestampMs = request.FromTimestampMs }
+                : null;
+
         long seq = 0;
-        var handle = await streams.SubscribeSourceAsync(
-            EnvironmentAmbient.Current, request.Name, async (row, tsMs) =>
-            {
-                seq++;
-                await responseStream.WriteAsync(new V1.SourceEvent
+        var writeGate = new SemaphoreSlim(1, 1);
+        var buffered = new List<V1.SourceEvent>();
+        var flushed = false;
+        var truncateNextLive = false;
+
+        IEntityReplaySubscription handle;
+        try
+        {
+            handle = await streams.SubscribeSourceAsync(
+                EnvironmentAmbient.Current, request.Name, from, async (row, tsMs, position) =>
                 {
-                    SourceName = request.Name,
-                    Seq = seq,
-                    TimestampMs = tsMs,
-                    Row = GrpcValueConverter.ToStruct(row),
+                    var evt = new V1.SourceEvent
+                    {
+                        SourceName = request.Name,
+                        Seq = ++seq,
+                        TimestampMs = tsMs,
+                        Row = GrpcValueConverter.ToStruct(row),
+                        Position = position,
+                    };
+
+                    await writeGate.WaitAsync();
+                    try
+                    {
+                        if (!flushed)
+                        {
+                            buffered.Add(evt);
+                            return;
+                        }
+
+                        if (truncateNextLive)
+                        {
+                            evt.ReplayTruncated = true;
+                            truncateNextLive = false;
+                        }
+                        await responseStream.WriteAsync(evt);
+                    }
+                    finally
+                    {
+                        writeGate.Release();
+                    }
                 });
-            });
+        }
+        catch (NotSupportedException ex)
+        {
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+
+        await writeGate.WaitAsync();
+        try
+        {
+            if (buffered.Count > 0)
+            {
+                buffered[0].ReplayTruncated = handle.Truncated;
+                foreach (var evt in buffered)
+                {
+                    await responseStream.WriteAsync(evt);
+                }
+            }
+            else if (handle.Truncated)
+            {
+                // Nothing retained matched the request — surface the truncation on the first LIVE event
+                // rather than lose it silently.
+                truncateNextLive = true;
+            }
+            flushed = true;
+        }
+        finally
+        {
+            writeGate.Release();
+        }
 
         await WaitForCancellationThenUnsubscribeAsync(handle, context.CancellationToken);
     }

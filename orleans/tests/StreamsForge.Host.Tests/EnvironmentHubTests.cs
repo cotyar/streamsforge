@@ -87,7 +87,8 @@ public sealed class EnvironmentHubTests
                 new SingleCatalogServiceProvider(new StubCatalog(
                     sources: [new SourceDefinition { Name = "s1" }],
                     pipelines: [new PipelineDefinition { Id = "p1" }],
-                    tables: [new TableDefinition { Id = "t1", Name = "orders" }])))
+                    tables: [new TableDefinition { Id = "t1", Name = "orders" }])),
+                new NullEntityStreamFacade())
             {
                 Context = new FakeCallerContext(PermissionResolverTests.Principal("alice"), features),
                 Groups = groups,
@@ -390,6 +391,29 @@ public sealed class EnvironmentHubTests
     // Fakes shared by Part A (StreamHubEntitlementTests' own shapes, duplicated rather than shared across
     // files — that file is owned by the plan-015 wave and this one must not edit it).
     // =================================================================================================
+
+    /// <summary>Plan 026 wave 1 — <see cref="StreamHub"/>'s new required <see cref="IEntityStreamFacade"/>
+    /// dependency, unused by every test in this file (none of them call <c>SubscribeSourceFrom</c>): every
+    /// member throws, so an accidental call is loud rather than silently returning nothing.</summary>
+    private sealed class NullEntityStreamFacade : IEntityStreamFacade
+    {
+        public Task<IAsyncDisposable> SubscribeSourceAsync(
+            string environment, string sourceName, Func<IReadOnlyDictionary<string, object?>, long, Task> onEvent) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IEntityReplaySubscription> SubscribeSourceAsync(
+            string environment, string sourceName, ReplayFrom? from,
+            Func<IReadOnlyDictionary<string, object?>, long, long, Task> onEvent) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IAsyncDisposable> SubscribePipelineAsync(
+            string environment, string pipelineId, Func<IReadOnlyList<ResultEnvelope>, Task> onResults) =>
+            throw new NotImplementedException("not exercised by this test");
+
+        public Task<IAsyncDisposable> SubscribeTableAsync(
+            string environment, string tableName, Func<IReadOnlyList<TableDeltaDto>, Task> onDeltas) =>
+            throw new NotImplementedException("not exercised by this test");
+    }
 
     private sealed class RecordingGroups : IGroupManager
     {
