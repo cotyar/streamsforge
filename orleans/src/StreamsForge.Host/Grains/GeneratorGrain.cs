@@ -4,6 +4,7 @@ using Orleans.Streams;
 using StreamsForge.Abstractions;
 using StreamsForge.Engine;
 using StreamsForge.Host.Generators;
+using StreamsForge.Host.Streaming;
 
 namespace StreamsForge.Host.Grains;
 
@@ -41,8 +42,27 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
     /// as it already is for <see cref="_timer"/>.</summary>
     private readonly Dictionary<string, ScenarioRunState> _runStates = new(StringComparer.Ordinal);
 
-    public Task StartAsync(SourceDefinition def)
+    /// <summary>Plan 026 wave 1: every publish site below goes through this gate, so a gRPC/SignalR
+    /// subscriber can attach from a position (<see cref="IReplayableSourceGrain"/>). Tables/pipelines
+    /// still subscribe to a generator WITHOUT the gate (a continuous source has no "missed first poll"),
+    /// until a definition opts in via <c>replayFrom</c> in wave 2.</summary>
+    private SourceReplayGate? _gate;
+    private SourceReplayGate Gate => _gate ??= new SourceReplayGate(
+        SourceStream,
+        release => this.RegisterGrainTimer(release, SourceReplayGate.SafetyRelease, Timeout.InfiniteTimeSpan));
+
+    private IAsyncStream<EventRecord> SourceStream() =>
+        this.GetStreamProvider(StreamConstants.ProviderName)
+            .GetStream<EventRecord>(StreamId.Create(StreamConstants.SourcesNamespace, this.GetPrimaryKeyString()));
+
+    public Task<SourceReplaySnapshot> BeginAttachAsync(ReplayFrom? from) => Task.FromResult(Gate.Begin(from));
+
+    public Task EndAttachAsync() => Gate.EndAsync();
+
+    public async Task StartAsync(SourceDefinition def)
     {
+        // Rows already produced are rows already owed — same rule as ConnectorGrain.StartAsync.
+        await Gate.ForceReleaseAsync();
         _def = def;
         _timer?.Dispose();
         _timer = null;
@@ -58,17 +78,17 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
 
         if (def.EventsPerSecond <= 0)
         {
-            return Task.CompletedTask;
+            return;
         }
 
         var intervalMs = Math.Clamp(1000.0 / def.EventsPerSecond, 1, 10_000);
         var period = TimeSpan.FromMilliseconds(intervalMs);
         _timer = this.RegisterGrainTimer(TickAsync, period, period);
-        return Task.CompletedTask;
     }
 
-    public Task StopAsync()
+    public async Task StopAsync()
     {
+        await Gate.ForceReleaseAsync();
         _timer?.Dispose();
         _timer = null;
         _loopbackDrainTimer?.Dispose();
@@ -77,7 +97,6 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
         // failure by the caller — see LoopbackHub.Detach's doc comment.
         LoopbackHub.Detach(this.GetPrimaryKeyString());
         _runStates.Clear();
-        return Task.CompletedTask;
     }
 
     public Task PingAsync() => Task.CompletedTask;
@@ -155,11 +174,9 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
             rows = result.Rows;
         }
 
-        var stream = this.GetStreamProvider(StreamConstants.ProviderName)
-            .GetStream<EventRecord>(StreamId.Create(StreamConstants.SourcesNamespace, this.GetPrimaryKeyString()));
         foreach (var row in rows)
         {
-            await stream.OnNextAsync(ScenarioGenerator.ToEventRecord(row, _def.Name));
+            await Gate.PublishAsync(ScenarioGenerator.ToEventRecord(row, _def.Name));
         }
 
         return new ScenarioRunResult { Outcome = ScenarioRunOutcome.Accepted, Accepted = rows.Count, Rows = rows };
@@ -173,9 +190,7 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
         }
 
         var evt = MarketDataProfiles.GenerateEvent(_def);
-        var stream = this.GetStreamProvider(StreamConstants.ProviderName)
-            .GetStream<EventRecord>(StreamId.Create(StreamConstants.SourcesNamespace, this.GetPrimaryKeyString()));
-        await stream.OnNextAsync(evt);
+        await Gate.PublishAsync(evt);
     }
 
     /// <summary>Wishlist #9(b): the loopback drain tick — see this class's doc comment and
@@ -211,9 +226,6 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
             return;
         }
 
-        var stream = this.GetStreamProvider(StreamConstants.ProviderName)
-            .GetStream<EventRecord>(StreamId.Create(StreamConstants.SourcesNamespace, this.GetPrimaryKeyString()));
-
         // Fresh _source/_ts on arrival — a row drained here is a NEW event at THIS source, same as a
         // ScenarioGenerator/MarketDataProfiles row would be, regardless of whatever stamped values (if
         // any) the upstream table's own row happened to carry.
@@ -225,7 +237,7 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
                 [EventRecord.SourceField] = _def.Name,
                 [EventRecord.TimestampField] = nowMs,
             };
-            await stream.OnNextAsync(evt);
+            await Gate.PublishAsync(evt);
         }
     }
 }

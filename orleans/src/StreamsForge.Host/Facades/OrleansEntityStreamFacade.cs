@@ -49,6 +49,14 @@ internal sealed class OrleansEntityStreamFacade(IClusterClient client) : IEntity
         return new Handle<EventRecord>(await stream.SubscribeAsync((evt, _) => onEvent(evt, evt.Timestamp)));
     }
 
+    /// <summary>Plan 026 wave 1 — STUB pinned by the orchestrator so both hosts build; wave 1 agent B
+    /// replaces it with the gated implementation (BeginAttachAsync(from) on the source's driver grain →
+    /// subscribe → replay → EndAttachAsync, positions continuing from LastSeq).</summary>
+    public Task<IEntityReplaySubscription> SubscribeSourceAsync(
+        string environment, string sourceName, ReplayFrom? from,
+        Func<IReadOnlyDictionary<string, object?>, long, long, Task> onEvent) =>
+        throw new NotImplementedException("plan 026 wave 1 agent B");
+
     public async Task<IAsyncDisposable> SubscribePipelineAsync(
         string environment, string pipelineId, Func<IReadOnlyList<ResultEnvelope>, Task> onResults)
     {

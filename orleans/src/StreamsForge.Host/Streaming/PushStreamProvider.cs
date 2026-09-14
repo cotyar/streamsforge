@@ -20,9 +20,11 @@ public sealed class PushStreamProvider(string name, PushStreamBus bus, IGrainCon
 
     public string Name { get; } = name;
 
-    /// <summary>No queue, no cursors — a push stream cannot be replayed from a sequence token. (Memory
-    /// streams report the same: <c>PersistentStreamProvider</c> over an in-memory queue is not
-    /// rewindable either, and nothing in this codebase subscribes with a token.)</summary>
+    /// <summary>No queue, no cursors — a push stream cannot be replayed from a sequence token. (Orleans'
+    /// memory adapter IS rewindable — <c>MemoryAdapterFactory.IsRewindable</c> returns true — but only
+    /// within one <c>SimpleQueueCache</c> of 4096 events per hash-ring queue shared by every stream in the
+    /// silo, and nothing in this codebase subscribes with a token: plan 026's replay lives ABOVE the
+    /// transport, in each producer's own log, so it works identically here.)</summary>
     public bool IsRewindable => false;
 
     public PushStreamBus Bus => bus;

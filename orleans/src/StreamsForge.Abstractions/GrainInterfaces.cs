@@ -21,7 +21,7 @@ public interface IPipelineGrain : IGrainWithStringKey
 }
 
 /// <summary>Key = source name. Publishes synthetic events on a grain timer.</summary>
-public interface IGeneratorGrain : IGrainWithStringKey
+public interface IGeneratorGrain : IReplayableSourceGrain
 {
     Task StartAsync(SourceDefinition def);
     Task StopAsync();
@@ -313,6 +313,43 @@ public sealed record SourceReplaySnapshot
 {
     [Id(0)] public List<Dictionary<string, object?>> Rows { get; set; } = [];
     [Id(1)] public long TotalSeen { get; set; }
+
+    // Plan 026 wave 1 — additive. Positions[i] is Rows[i]'s producer-assigned position; FirstSeq/LastSeq
+    // describe what the producer RETAINS (not this selection); Truncated is "an entry the request would
+    // have matched was already evicted". A pre-026 caller reading only Rows/TotalSeen is unaffected.
+    [Id(2)] public List<long> Positions { get; set; } = [];
+    [Id(3)] public long FirstSeq { get; set; }
+    [Id(4)] public long LastSeq { get; set; }
+    [Id(5)] public bool Truncated { get; set; }
+}
+
+/// <summary>Plan 026 D2 — the attach gate IS the replay API. Every source-kind driver that publishes
+/// onto (<c>StreamConstants.SourcesNamespace</c>, source name) implements this: connector
+/// (<see cref="IConnectorGrain"/>), generator (<see cref="IGeneratorGrain"/>) and ingest
+/// (<see cref="IIngestSourceGrain"/>). The protocol is plan 023's, verbatim (see the long doc on
+/// <see cref="IConnectorGrain"/>): Begin → subscribe → feed the snapshot through the same handler → End
+/// in a <c>finally</c>. <paramref name="from"/> selects where the snapshot starts (null = everything
+/// retained, exactly what the parameterless plan 023 call meant). Resolve the concrete interface by
+/// <c>SourceKindDispatch.Classify(def.Kind)</c> — three grain classes implement this, so
+/// <c>GetGrain&lt;IReplayableSourceGrain&gt;</c> alone is ambiguous.</summary>
+public interface IReplayableSourceGrain : IGrainWithStringKey
+{
+    Task<SourceReplaySnapshot> BeginAttachAsync(ReplayFrom? from);
+
+    /// <summary>Drops one hold taken by <c>BeginAttachAsync</c>; at zero, everything the source
+    /// produced while held is published. Always call it in a <c>finally</c>.</summary>
+    Task EndAttachAsync();
+}
+
+/// <summary>Plan 026 D3 — the turn-based owner of an INGEST source's publishing. Ingest rows used to go
+/// from <c>OrleansIngressFacade</c>'s drain pump straight onto the stream (a facade, no grain), which
+/// left nowhere for the attach gate and the replay log to live. One grain per (qualified) ingest source
+/// name, one call per drained batch; <c>SourceIngressBuffer</c>, overflow policy and the
+/// <c>DownstreamDropped</c> accounting stay in the facade, untouched.</summary>
+public interface IIngestSourceGrain : IReplayableSourceGrain
+{
+    /// <summary>Stamps and publishes one drained batch through the gate, in order.</summary>
+    Task PublishAsync(List<Dictionary<string, object?>> rows);
 }
 
 /// <summary>Key = source name. Drives one connector-kind source ("url" | "file" | "folder" | "grpc" —
@@ -321,7 +358,7 @@ public sealed record SourceReplaySnapshot
 /// a persistent subscription to a remote StreamsForge instance (D-G federation) fed by a background
 /// task whose callbacks marshal back through <see cref="EmitRowsAsync"/> (grain-safe re-entry — the
 /// callbacks run off this grain's turn and must not touch grain state directly).</summary>
-public interface IConnectorGrain : IGrainWithStringKey
+public interface IConnectorGrain : IReplayableSourceGrain
 {
     Task StartAsync(SourceDefinition def);
     Task StopAsync();
@@ -362,10 +399,8 @@ public interface IConnectorGrain : IGrainWithStringKey
     /// consumer that dies between the two calls does NOT gate the source forever — the driver arms its own
     /// short safety release. Only sources classified <c>SourceKindDispatch.ActorKind.Connector</c> have
     /// this driver at all; generators (continuous), ingest sources and CRDT documents are attached to
-    /// without it.</para></summary>
+    /// without it. (Plan 026: generators and ingest sources now carry the same gate through
+    /// <see cref="IReplayableSourceGrain"/>, but tables/pipelines still attach to them without it until
+    /// a definition opts in via <c>replayFrom</c> — wave 2. Only gRPC/SignalR subscribers use theirs.)</para></summary>
     Task<SourceReplaySnapshot> BeginAttachAsync();
-
-    /// <summary>Drops one hold taken by <see cref="BeginAttachAsync"/>; at zero, everything the source
-    /// produced while held is published. Always call it in a <c>finally</c> — see the protocol above.</summary>
-    Task EndAttachAsync();
 }

@@ -11,6 +11,7 @@ using StreamsForge.AppCore.Environments;
 using StreamsForge.AppCore.Net;
 using StreamsForge.AppCore.Transports;
 using StreamsForge.Engine;
+using StreamsForge.Host.Streaming;
 
 namespace StreamsForge.Host.Grains;
 
@@ -82,7 +83,7 @@ public interface IConnectorStatusSink : IGrainWithStringKey
 /// both publish sites (the poll cycle's emission loop and EmitRowsAsync's subscriber path) go through it,
 /// which is what lets the late-consumer attach gate (BeginAttachAsync/EndAttachAsync — see
 /// IConnectorGrain's own doc for the protocol) be total rather than best-effort, and what feeds the
-/// bounded SourceReplayBuffer a late-subscribing table/pipeline replays from.
+/// bounded replay log (plan 026: SourceReplayGate) a late-subscribing table/pipeline replays from.
 ///
 /// State ([PersistentState("connector", ...)]) is written after every completed cycle (poll rates are
 /// low — D-E's 1s floor) so status/dedup/ledger survive a silo recycle; OnActivateAsync self-resumes
@@ -134,24 +135,13 @@ public sealed class ConnectorGrain(
     // leaves this grain through, which is what makes the gate total rather than best-effort.
     // ------------------------------------------------------------------
 
-    /// <summary>Bounded memory of what this activation has already published, handed to a consumer that
-    /// subscribes late. In-memory, per activation — empty after a silo recycle, deliberately.</summary>
-    private readonly SourceReplayBuffer _replay = new();
-
-    /// <summary>Outstanding <see cref="BeginAttachAsync"/> holds. While &gt; 0, rows go to
-    /// <see cref="_pending"/> instead of the stream. A grain turn is the unit of atomicity here — nothing
-    /// interleaves inside a single method body between the check and the append — so no lock is needed and
-    /// none would help.</summary>
-    private int _attachHolds;
-
-    private readonly List<EventRecord> _pending = [];
-
-    /// <summary>Force-release for a consumer that took a hold and never came back (it crashed, its silo
-    /// went away, its StartAsync threw between the two calls). Without it one dead attacher would gate the
-    /// source's publishing for the life of the activation — a far worse failure than the duplicate-free
-    /// replay the hold buys.</summary>
-    private static readonly TimeSpan AttachSafetyRelease = TimeSpan.FromSeconds(10);
-    private IGrainTimer? _attachReleaseTimer;
+    /// <summary>Plan 026: the late-consumer attach gate + replay log (plan 023's private fields, lifted
+    /// into <see cref="SourceReplayGate"/> so generators and ingest sources own the identical mechanism).
+    /// Created on first use because the safety timer needs <c>this</c>.</summary>
+    private SourceReplayGate? _gate;
+    private SourceReplayGate Gate => _gate ??= new SourceReplayGate(
+        SourceStream,
+        release => this.RegisterGrainTimer(release, SourceReplayGate.SafetyRelease, Timeout.InfiniteTimeSpan));
 
     // Emission-counter persist throttle for the gRPC/NATS path (EmitRowsAsync can fire once per remote
     // frame/message — far more often than a poll cycle's natural "persist once per cycle" cadence):
@@ -174,7 +164,7 @@ public sealed class ConnectorGrain(
         // Rows already produced are rows already owed: flush anything an attach hold is sitting on BEFORE
         // the generation bump below makes this activation disown the cycle that produced them. Dropping
         // them here would reintroduce, on the restart path, exactly the loss the gate exists to prevent.
-        await ReleaseAttachHoldsAndFlushAsync();
+        await Gate.ForceReleaseAsync();
 
         state.State.Def = def;
         state.State.Running = true;
@@ -206,7 +196,7 @@ public sealed class ConnectorGrain(
     {
         // Same reasoning as StartAsync's identical call: a stop must not eat rows this source had already
         // produced and merely deferred on a consumer's behalf.
-        await ReleaseAttachHoldsAndFlushAsync();
+        await Gate.ForceReleaseAsync();
 
         state.State.Running = false;
         _generation++;
@@ -402,90 +392,15 @@ public sealed class ConnectorGrain(
 
     /// <summary>THE single door every row leaves this grain through — both publish sites (the poll cycle's
     /// emission loop and <see cref="EmitRowsAsync"/>'s subscriber path) call it, and a third one must too.
-    /// While an attach hold is outstanding the row is deferred rather than published; otherwise it goes to
-    /// the stream and is then remembered in <see cref="_replay"/> for whoever subscribes next. The ring is
-    /// appended AFTER the publish deliberately: a row that failed to publish is not a row a late consumer
-    /// should be told it missed — the cycle's own error path owns that failure (see
-    /// <see cref="RunCycleAsync"/>), and the next cycle re-reads and re-emits it.</summary>
-    private async Task PublishAsync(EventRecord evt)
-    {
-        if (_attachHolds > 0)
-        {
-            _pending.Add(evt);
-            return;
-        }
+    /// See <see cref="SourceReplayGate.PublishAsync"/> for the hold/replay rule.</summary>
+    private Task PublishAsync(EventRecord evt) => Gate.PublishAsync(evt);
 
-        await SourceStream().OnNextAsync(evt);
-        _replay.Append(new Dictionary<string, object?>(evt));
-    }
+    /// <summary>See <see cref="IConnectorGrain.BeginAttachAsync()"/> for the protocol and why it is correct.</summary>
+    public Task<SourceReplaySnapshot> BeginAttachAsync() => BeginAttachAsync(null);
 
-    /// <summary>See <see cref="IConnectorGrain.BeginAttachAsync"/> for the protocol and why it is correct.
-    /// Synchronous by construction (no await before the hold is taken and the snapshot read) — a grain turn
-    /// is indivisible, so no cycle or subscriber callback can slip a publish between the two.</summary>
-    public Task<SourceReplaySnapshot> BeginAttachAsync()
-    {
-        _attachHolds++;
+    public Task<SourceReplaySnapshot> BeginAttachAsync(ReplayFrom? from) => Task.FromResult(Gate.Begin(from));
 
-        // One shared safety timer, re-armed on every Begin: the deadline that matters is "10s since the
-        // most recent attach started", so several overlapping consumers each get their own full window and
-        // a single abandoned hold still cannot outlive it.
-        _attachReleaseTimer?.Dispose();
-        _attachReleaseTimer = this.RegisterGrainTimer(ForceReleaseAttachAsync, AttachSafetyRelease, Timeout.InfiniteTimeSpan);
-
-        var (rows, totalSeen) = _replay.Snapshot();
-        return Task.FromResult(new SourceReplaySnapshot { Rows = rows, TotalSeen = totalSeen });
-    }
-
-    public async Task EndAttachAsync()
-    {
-        if (_attachHolds > 0)
-        {
-            _attachHolds--;
-        }
-
-        if (_attachHolds == 0)
-        {
-            _attachReleaseTimer?.Dispose();
-            _attachReleaseTimer = null;
-            await FlushPendingAsync();
-        }
-    }
-
-    /// <summary>The safety timer's target — see <see cref="AttachSafetyRelease"/>. Releases EVERY hold, not
-    /// one: the only situation this fires in is "somebody is not coming back", and there is no way to tell
-    /// which holder that was.</summary>
-    private Task ForceReleaseAttachAsync() => ReleaseAttachHoldsAndFlushAsync();
-
-    private async Task ReleaseAttachHoldsAndFlushAsync()
-    {
-        _attachHolds = 0;
-        _attachReleaseTimer?.Dispose();
-        _attachReleaseTimer = null;
-        await FlushPendingAsync();
-    }
-
-    /// <summary>Publishes everything deferred while the gate was closed, oldest first, through the stream
-    /// directly rather than back through <see cref="PublishAsync"/> — a hold taken WHILE this flush is
-    /// awaiting must not re-queue rows that are already on their way out and re-order them behind newer
-    /// ones. A throw here abandons the rest of the batch; the deferral list is cleared up front so a
-    /// failed flush cannot be replayed twice by a later one.</summary>
-    private async Task FlushPendingAsync()
-    {
-        if (_pending.Count == 0)
-        {
-            return;
-        }
-
-        var pending = _pending.ToList();
-        _pending.Clear();
-
-        var stream = SourceStream();
-        foreach (var evt in pending)
-        {
-            await stream.OnNextAsync(evt);
-            _replay.Append(new Dictionary<string, object?>(evt));
-        }
-    }
+    public Task EndAttachAsync() => Gate.EndAsync();
 
     // ------------------------------------------------------------------
     // Arming

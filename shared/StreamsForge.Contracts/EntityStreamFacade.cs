@@ -60,6 +60,19 @@ public interface IEntityStreamFacade
     Task<IAsyncDisposable> SubscribeSourceAsync(
         string environment, string sourceName, Func<IReadOnlyDictionary<string, object?>, long, Task> onEvent);
 
+    /// <summary>Plan 026 wave 1 — the same subscription, started from a position or an event time.
+    /// Retained entries matching <paramref name="from"/> are delivered through <paramref name="onEvent"/>
+    /// FIRST (oldest first, each with its producer position), then live events follow with consecutive
+    /// positions; the returned handle says what the producer retained and whether the request reached
+    /// past it. <paramref name="from"/> null = live only, from the current position (a plain
+    /// <see cref="SubscribeSourceAsync(string, string, Func{IReadOnlyDictionary{string, object?}, long, Task})"/>
+    /// with positions). The callback's third argument is the position. Orleans runs plan 023's attach
+    /// gate around the subscribe so nothing is both replayed and delivered live; Dapr accepts and
+    /// ignores <paramref name="from"/> until its port (dapr/PARITY.md).</summary>
+    Task<IEntityReplaySubscription> SubscribeSourceAsync(
+        string environment, string sourceName, ReplayFrom? from,
+        Func<IReadOnlyDictionary<string, object?>, long, long, Task> onEvent);
+
     /// <summary>Result batches emitted by one running pipeline, addressed by pipeline ID (the key both
     /// runtimes publish under — a name-addressed subscription resolves to an id before calling this).</summary>
     Task<IAsyncDisposable> SubscribePipelineAsync(
@@ -69,4 +82,15 @@ public interface IEntityStreamFacade
     /// publish under). No sequence number — see the block comment.</summary>
     Task<IAsyncDisposable> SubscribeTableAsync(
         string environment, string tableName, Func<IReadOnlyList<TableDeltaDto>, Task> onDeltas);
+}
+
+/// <summary>Plan 026 — a replaying subscription's handle. Disposing unsubscribes exactly this subscription.
+/// <see cref="FirstSeq"/>/<see cref="LastSeq"/> are what the producer retained at attach time (not the
+/// selection); <see cref="Truncated"/> is true when the request reached past the oldest retained entry
+/// — the honest "you got the last N of M", never a silent gap.</summary>
+public interface IEntityReplaySubscription : IAsyncDisposable
+{
+    long FirstSeq { get; }
+    long LastSeq { get; }
+    bool Truncated { get; }
 }

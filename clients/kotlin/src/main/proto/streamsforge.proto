@@ -293,6 +293,11 @@ service TableService {
 
 message SubscribeSourceRequest {
   string name = 1;
+  // Plan 026: start from a producer position (1-based; 0 = unset) or an event time (epoch ms; 0 =
+  // unset). from_seq wins when both are set. Retained events matching the request are delivered
+  // first, then live ones; positions are consecutive across the boundary.
+  int64 from_seq = 2;
+  int64 from_timestamp_ms = 3;
 }
 
 // One raw synthetic event from a source generator. seq is assigned per gRPC subscription
@@ -302,6 +307,12 @@ message SourceEvent {
   int64 seq = 2;
   int64 timestamp_ms = 3;
   google.protobuf.Struct row = 4;
+  // Plan 026: the PRODUCER's position for this event — the same number every subscriber sees for the
+  // same event, and the value to pass back as from_seq. seq stays the per-subscription counter.
+  int64 position = 5;
+  // Plan 026: set on the FIRST event of a subscription when from_seq/from_timestamp_ms reached past
+  // what the producer still retains — the events before it are not recoverable.
+  bool replay_truncated = 6;
 }
 
 message SubscribePipelineRequest {

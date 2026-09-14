@@ -64,6 +64,26 @@ public sealed class EntityStreamFanout : ISourceEventsSink, ITableDeltaSink, IPi
             return onEvent(row, tsMs);
         }));
 
+    /// <summary>Plan 026 wave 1 — Dapr accepts and IGNORES <paramref name="from"/> (owed: dapr/PARITY.md).
+    /// Positions are counted per subscription from 1, so a client sees the same shape as Orleans; the
+    /// handle reports nothing retained and Truncated whenever a replay was actually asked for.</summary>
+    public async Task<IEntityReplaySubscription> SubscribeSourceAsync(
+        string environment, string sourceName, ReplayFrom? from,
+        Func<IReadOnlyDictionary<string, object?>, long, long, Task> onEvent)
+    {
+        long position = 0;
+        var inner = await SubscribeSourceAsync(environment, sourceName, (row, ts) => onEvent(row, ts, ++position));
+        return new ReplayHandle(inner, truncated: from is { IsEmpty: false });
+    }
+
+    private sealed class ReplayHandle(IAsyncDisposable inner, bool truncated) : IEntityReplaySubscription
+    {
+        public long FirstSeq => 1;
+        public long LastSeq => 0;
+        public bool Truncated => truncated;
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
+
     public Task<IAsyncDisposable> SubscribePipelineAsync(
         string environment, string pipelineId, Func<IReadOnlyList<ResultEnvelope>, Task> onResults)
         // Keyed by the BARE pipeline id, not EnvKeys.Qualify(environment, id): PipelineActor publishes
