@@ -1,5 +1,6 @@
 using Orleans.Streams;
 using StreamsForge.Abstractions;
+using StreamsForge.AppCore.Streaming;
 using StreamsForge.Engine;
 
 namespace StreamsForge.Host.Streaming;
@@ -24,6 +25,13 @@ internal sealed class SourceReplayGate
 
     public int Holds => _gate.Holds;
     public long LastSeq => _gate.LastSeq;
+    public bool Persisted => _gate.Persisted;
+    public ReplayStatus Status => _gate.Status;
+
+    public void EnablePersistence(ReplaySegmentLog disk, Func<EventRecord, string> serialize, Func<string, EventRecord> deserialize) =>
+        _gate.EnablePersistence(disk, serialize, deserialize);
+
+    public Task FlushAsync() => _gate.FlushAsync();
 
     public Task PublishAsync(EventRecord evt) => _gate.PublishAsync(evt);
 

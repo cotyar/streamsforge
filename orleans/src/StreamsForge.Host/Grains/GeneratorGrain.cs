@@ -59,6 +59,8 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
 
     public Task EndAttachAsync() => Gate.EndAsync();
 
+    public Task<ReplayStatus> GetReplayStatusAsync() => Task.FromResult(Gate.Status);
+
     public async Task StartAsync(SourceDefinition def)
     {
         // Rows already produced are rows already owed — same rule as ConnectorGrain.StartAsync.

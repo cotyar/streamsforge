@@ -58,6 +58,8 @@ public sealed class PipelineGrain(ILogger<PipelineGrain> logger) : Grain, IPipel
 
     public Task EndAttachAsync() => Gate.EndAsync();
 
+    public Task<ReplayStatus> GetReplayStatusAsync() => Task.FromResult(Gate.Status);
+
     public async Task StartAsync(PipelineDefinition def)
     {
         await StopAsync();

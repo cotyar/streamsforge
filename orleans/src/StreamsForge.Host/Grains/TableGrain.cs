@@ -446,6 +446,8 @@ public sealed class TableGrain(
 
     public Task EndAttachAsync() => _coordinatorMode ? Task.CompletedTask : Gate.EndAsync();
 
+    public Task<ReplayStatus> GetReplayStatusAsync() => Task.FromResult(_coordinatorMode ? new ReplayStatus() : Gate.Status);
+
     public async Task StartAsync(TableDefinition def)
     {
         await StopAsync();

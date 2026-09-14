@@ -31,6 +31,8 @@ public sealed class IngestSourceGrain : Grain, IIngestSourceGrain
 
     public Task EndAttachAsync() => Gate.EndAsync();
 
+    public Task<ReplayStatus> GetReplayStatusAsync() => Task.FromResult(Gate.Status);
+
     public async Task PublishAsync(List<Dictionary<string, object?>> rows)
     {
         foreach (var record in IngressEnvelopeBuilder.ToEventRecords(rows))

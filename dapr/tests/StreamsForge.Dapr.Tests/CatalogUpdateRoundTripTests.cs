@@ -122,6 +122,12 @@ public class CatalogUpdateRoundTripTests
             return new Dictionary<string, ReplayFrom> { [$"in_{prop.Name}"] = new ReplayFrom { Seq = 42 } };
         }
 
+        // Plan 026 D6: the disk-tier retention group is client-owned like replayFrom.
+        if (type == typeof(ReplayConfig))
+        {
+            return new ReplayConfig { Persist = true, RetainMs = 60_000, MaxBytes = 1 << 20 };
+        }
+
         if (type == typeof(List<SinkSpec>))
         {
             return new List<SinkSpec>

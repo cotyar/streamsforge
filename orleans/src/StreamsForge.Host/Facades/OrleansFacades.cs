@@ -73,6 +73,7 @@ public static class OrleansFacadesExtensions
         services.AddSingleton<ITableShardFacade, OrleansTableShardFacade>();
         services.AddSingleton<IArrangementMetaFacade, OrleansArrangementMetaFacade>();
         services.AddSingleton<IConnectorStatusFacade, OrleansConnectorStatusFacade>();
+        services.AddSingleton<IReplayStatusFacade, OrleansReplayStatusFacade>();
         // Plan 020 wave B-2 / CRDT-as-a-plugin: the real Orleans CRDT facade now lives in the
         // StreamsForge.Plugins.Crdt plugin (OrleansCrdtFacade, always Enabled — Orleans is the
         // CRDT-capable flavour, D9), not here. This registers the same DISABLED default the Dapr flavor
@@ -472,5 +473,38 @@ internal sealed class OrleansArrangementMetaFacade(IClusterClient client) : IArr
         }
 
         return result;
+    }
+}
+
+/// <summary>Plan 026 D6 — the Orleans half of <see cref="IReplayStatusFacade"/>: asks the producer's own
+/// gate (source drivers by kind, pipelines by qualified id, tables by qualified name). Reads the request's
+/// ambient environment like the other facades here.</summary>
+internal sealed class OrleansReplayStatusFacade(IClusterClient client) : IReplayStatusFacade
+{
+    public async Task<ReplayStatus?> GetSourceAsync(string sourceName)
+    {
+        var env = EnvironmentAmbient.Current;
+        var def = await client.RegistryFor(env).GetSourceAsync(sourceName);
+        if (def is null) return null;
+        var grain = Streaming.ReplayInputs.DriverFor(client, def.Kind, EnvKeys.Qualify(env, sourceName));
+        return grain is null
+            ? new ReplayStatus()
+            : await grain.GetReplayStatusAsync();
+    }
+
+    public async Task<ReplayStatus?> GetPipelineAsync(string pipelineId)
+    {
+        var env = EnvironmentAmbient.Current;
+        var def = await client.RegistryFor(env).GetPipelineAsync(pipelineId);
+        if (def is null) return null;
+        return await client.GetGrain<IPipelineGrain>(EnvKeys.Qualify(env, def.Id)).GetReplayStatusAsync();
+    }
+
+    public async Task<ReplayStatus?> GetTableAsync(string tableName)
+    {
+        var env = EnvironmentAmbient.Current;
+        var def = await client.RegistryFor(env).GetTableAsync(tableName);
+        if (def is null) return null;
+        return await client.GetGrain<ITableGrain>(EnvKeys.Qualify(env, def.Name)).GetReplayStatusAsync();
     }
 }

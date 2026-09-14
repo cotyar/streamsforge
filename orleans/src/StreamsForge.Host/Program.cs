@@ -346,6 +346,12 @@ builder.Services.AddHostedService<NatsPublisherService>();
 builder.Services.AddStreamsForgeGrpc();
 builder.Services.AddSingleton<IEntityStreamFacade, OrleansEntityStreamFacade>();
 
+// Plan 026 D6 — host defaults for the disk-backed replay tier (Replay:SegmentBytes / RetainMs /
+// MaxBytesPerStream); the directory defaults to DataDir/replay, next to the grain state it belongs with.
+builder.Services.AddOptions<StreamsForge.AppCore.Streaming.ReplayOptions>()
+    .Bind(builder.Configuration.GetSection("Replay"))
+    .PostConfigure(o => o.Directory ??= Path.Combine(builder.Configuration["DataDir"] ?? "./data", "replay"));
+
 // Plan 014-I: the out-of-core database connectors' only call site. InboundTransports/PolledTransports
 // both document "before any source starts" as the registration deadline; nothing in this process can
 // start a source before builder.Build() returns and the hosted services below get to Run(), so anywhere

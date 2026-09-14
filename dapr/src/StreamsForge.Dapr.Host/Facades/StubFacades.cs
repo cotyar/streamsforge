@@ -72,3 +72,13 @@ public sealed class EmptyArrangementMetaFacade : IArrangementMetaFacade
     public Task<IReadOnlyList<ArrangementMetaInfo>> GetArrangementsAsync() =>
         Task.FromResult<IReadOnlyList<ArrangementMetaInfo>>([]);
 }
+
+/// <summary>Plan 026 D6 — this flavor has no replay log yet (dapr/PARITY.md D11): the three
+/// <c>/replay</c> routes answer 501 with this message rather than inventing a status.</summary>
+public sealed class StubReplayStatusFacade : IReplayStatusFacade
+{
+    private const string Reason = "replay status is not available on the Dapr flavor: its producers have no position-addressed replay log yet (dapr/PARITY.md D11)";
+    public Task<ReplayStatus?> GetSourceAsync(string sourceName) => throw new NotSupportedException(Reason);
+    public Task<ReplayStatus?> GetPipelineAsync(string pipelineId) => throw new NotSupportedException(Reason);
+    public Task<ReplayStatus?> GetTableAsync(string tableName) => throw new NotSupportedException(Reason);
+}

@@ -402,6 +402,8 @@ public sealed class ConnectorGrain(
 
     public Task EndAttachAsync() => Gate.EndAsync();
 
+    public Task<ReplayStatus> GetReplayStatusAsync() => Task.FromResult(Gate.Status);
+
     // ------------------------------------------------------------------
     // Arming
     // ------------------------------------------------------------------

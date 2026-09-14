@@ -121,6 +121,10 @@ public sealed class SourceDefinition
     /// deployable to exactly one place, which is the opposite of the point. The environment is a property
     /// of the import CALL. Config export therefore omits it, and import writes it from the target.</para></summary>
     [Id(16)] public string Environment { get; set; } = "";
+
+    /// <summary>Plan 026 D6 (additive): disk-backed replay retention for this source's log — see
+    /// <see cref="ReplayConfig"/>. Null = in-memory ring only.</summary>
+    [Id(17)] public ReplayConfig? Replay { get; set; }
 }
 
 /// <summary>Well-known <see cref="SourceDefinition.GeneratorProfile"/> values that have a dedicated
@@ -550,6 +554,10 @@ public sealed class PipelineDefinition
     /// before (plan 023's default late-attach for connector sources; live-only for generators/ingest).
     /// Dapr stores it and refuses to START with it set (`dapr/PARITY.md` D11). Empty = off.</summary>
     [Id(19)] public Dictionary<string, ReplayFrom> ReplayFrom { get; set; } = [];
+
+    /// <summary>Plan 026 D6 (additive): disk-backed retention for this pipeline's result-batch log — see
+    /// <see cref="ReplayConfig"/>. Null = in-memory ring only.</summary>
+    [Id(20)] public ReplayConfig? Replay { get; set; }
 }
 
 /// <summary>One emitted result row. Values are primitives only (string/double/long/bool/null).</summary>
@@ -891,6 +899,11 @@ public sealed class TableDefinition
     /// through the backfill snapshot, plan 023's protocol; a position on a table input is wave 3 work) and
     /// validation refuses it with that reason. Dapr stores it and refuses to START with it set. Empty = off.</summary>
     [Id(37)] public Dictionary<string, ReplayFrom> ReplayFrom { get; set; } = [];
+
+    /// <summary>Plan 026 D6 (additive): disk-backed retention for this table's delta-batch log — see
+    /// <see cref="ReplayConfig"/>. Null = in-memory ring only. Classic mode only (coordinator-mode deltas
+    /// are published by <c>TableOutputGrain</c>; wave 3 does not route them through the gate).</summary>
+    [Id(38)] public ReplayConfig? Replay { get; set; }
 }
 
 /// <summary>Plan 008: per-table durability policy. State is the materialized snapshot; the question is only

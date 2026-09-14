@@ -35,6 +35,9 @@ public interface IReplayableBatchGrain<T> : IGrainWithStringKey
 {
     Task<StreamReplaySnapshot<T>> BeginAttachAsync(ReplayFrom? from);
 
+    /// <summary>Plan 026 D6: what this producer retains right now (memory + disk).</summary>
+    Task<ReplayStatus> GetReplayStatusAsync();
+
     /// <summary>Drops one hold; at zero, everything deferred while held is published. Always in a
     /// <c>finally</c>.</summary>
     Task EndAttachAsync();
@@ -373,6 +376,9 @@ public sealed record SourceReplaySnapshot
 public interface IReplayableSourceGrain : IGrainWithStringKey
 {
     Task<SourceReplaySnapshot> BeginAttachAsync(ReplayFrom? from);
+
+    /// <summary>Plan 026 D6: what this producer retains right now (memory + disk).</summary>
+    Task<ReplayStatus> GetReplayStatusAsync();
 
     /// <summary>Drops one hold taken by <c>BeginAttachAsync</c>; at zero, everything the source
     /// produced while held is published. Always call it in a <c>finally</c>.</summary>

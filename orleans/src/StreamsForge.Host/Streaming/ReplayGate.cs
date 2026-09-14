@@ -34,6 +34,31 @@ internal sealed class ReplayGate<T>(
     public long LastSeq => _log.LastSeq;
     public long FirstSeq => _log.FirstSeq;
 
+    /// <summary>Plan 026 D6 — turns the disk tier on; must precede the first publish (see
+    /// <see cref="ReplayLog{T}.AttachPersistence"/>). Idempotent for the same instance's lifetime.</summary>
+    public void EnablePersistence(ReplaySegmentLog disk, Func<T, string> serialize, Func<string, T> deserialize)
+    {
+        if (!_log.Persisted)
+        {
+            _log.AttachPersistence(disk, serialize, deserialize);
+        }
+    }
+
+    public bool Persisted => _log.Persisted;
+
+    /// <summary>The owner's write-behind hook: call on its flush cadence and on stop/deactivate.</summary>
+    public Task FlushAsync() => _log.FlushAsync();
+
+    public ReplayStatus Status => new()
+    {
+        FirstSeq = _log.FirstSeq,
+        LastSeq = _log.LastSeq,
+        TotalSeen = _log.TotalSeen,
+        RetainedBytes = _log.RetainedBytes,
+        Persisted = _log.Persisted,
+        Segments = _log.SegmentCount,
+    };
+
     /// <summary>THE single door every item leaves the owning grain through — deferred while a hold is
     /// outstanding, else published then remembered. Appended AFTER the publish deliberately: an item that
     /// failed to publish is not one a late consumer should be told it missed.</summary>

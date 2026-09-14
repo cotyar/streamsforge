@@ -37,6 +37,11 @@ public sealed class ReplayLog<T>
     private readonly Func<long> _clock;
     private readonly Queue<(ReplayEntry<T> Entry, long AppendedAtMs)> _ring = new();
 
+    // Plan 026 D6 — the optional disk tier. Null = waves 1–2 behaviour (memory only).
+    private ReplaySegmentLog? _disk;
+    private Func<T, string>? _serialize;
+    private Func<string, T>? _deserialize;
+
     public int Capacity { get; }
 
     /// <summary>Age retention in ms; 0 = count only.</summary>
@@ -47,11 +52,42 @@ public sealed class ReplayLog<T>
 
     public long LastSeq => TotalSeen;
 
-    /// <summary>Oldest retained seq, or <c>LastSeq + 1</c> when nothing is retained (so the empty
-    /// range reads as "next position", never as 0).</summary>
-    public long FirstSeq => _ring.Count == 0 ? TotalSeen + 1 : _ring.Peek().Entry.Seq;
+    /// <summary>Oldest retained seq — on disk when the disk tier is on and still holds older segments,
+    /// else in the ring — or <c>LastSeq + 1</c> when nothing is retained (so the empty range reads as
+    /// "next position", never as 0).</summary>
+    public long FirstSeq
+    {
+        get
+        {
+            var ringFirst = _ring.Count == 0 ? TotalSeen + 1 : _ring.Peek().Entry.Seq;
+            var diskFirst = _disk?.FirstSeq ?? 0;
+            return diskFirst > 0 ? Math.Min(diskFirst, ringFirst) : ringFirst;
+        }
+    }
 
     public int Count => _ring.Count;
+
+    public bool Persisted => _disk is not null;
+    public long RetainedBytes => _disk?.RetainedBytes ?? 0;
+    public int SegmentCount => _disk?.SegmentCount ?? 0;
+
+    /// <summary>Plan 026 D6 — turns the disk tier on. Must run BEFORE the first <see cref="Append"/> of this
+    /// instance: positions continue from the disk's <see cref="ReplaySegmentLog.LastSeq"/>, which is what
+    /// makes a position durable across a restart. A snapshot request the ring cannot satisfy falls back to
+    /// the segments; <see cref="FlushAsync"/> is the owner's write-behind hook.</summary>
+    public void AttachPersistence(ReplaySegmentLog disk, Func<T, string> serialize, Func<string, T> deserialize)
+    {
+        if (TotalSeen != 0)
+        {
+            throw new InvalidOperationException("attach the disk tier before the first append — positions must continue from it");
+        }
+        _disk = disk;
+        _serialize = serialize;
+        _deserialize = deserialize;
+        TotalSeen = disk.LastSeq;
+    }
+
+    public Task FlushAsync() => _disk?.FlushAsync() ?? Task.CompletedTask;
 
     /// <param name="timestampOf">The item's event time (a row's <c>_ts</c>).</param>
     /// <param name="copy">Defensive copy applied on append AND on snapshot, so neither the producer's
@@ -71,7 +107,9 @@ public sealed class ReplayLog<T>
     {
         var seq = ++TotalSeen;
         var now = _clock();
-        _ring.Enqueue((new ReplayEntry<T>(seq, _timestampOf(item), _copy(item)), now));
+        var ts = _timestampOf(item);
+        _ring.Enqueue((new ReplayEntry<T>(seq, ts, _copy(item)), now));
+        _disk?.Append(seq, ts, _serialize!(item));
         while (_ring.Count > Capacity)
         {
             _ring.Dequeue();
@@ -81,13 +119,35 @@ public sealed class ReplayLog<T>
     }
 
     /// <summary>Entries matching <paramref name="from"/>, oldest first. Seq wins over timestamp when
-    /// both are set; a null/empty request returns everything retained.</summary>
+    /// both are set; a null/empty request returns everything retained. With the disk tier on, entries the
+    /// ring no longer holds are read from the segments first (disk entries are re-materialized through the
+    /// deserializer, ring entries are copied), so "retained" means memory + disk and <see cref="ReplaySnapshot{T}.Truncated"/>
+    /// only ever means "before what the DISK still has" once it is on.</summary>
     public ReplaySnapshot<T> Snapshot(ReplayFrom? from = null)
     {
         EvictAged(_clock());
-        var evicted = TotalSeen - _ring.Count;
+        var ringFirst = _ring.Count == 0 ? TotalSeen + 1 : _ring.Peek().Entry.Seq;
         var entries = new List<ReplayEntry<T>>();
+
+        // Disk part: everything older than the ring that the request reaches.
+        if (_disk is not null && _disk.FirstSeq > 0 && _disk.FirstSeq < ringFirst)
+        {
+            var startSeq = from?.Seq is { } fs ? Math.Max(fs, _disk.FirstSeq) : _disk.FirstSeq;
+            if (startSeq < ringFirst)
+            {
+                foreach (var e in _disk.ReadFrom(startSeq))
+                {
+                    if (e.Seq >= ringFirst) break;
+                    if (from?.Seq is null && from?.TimestampMs is { } fts && e.TimestampMs < fts) continue;
+                    entries.Add(new ReplayEntry<T>(e.Seq, e.TimestampMs, _deserialize!(e.PayloadJson)));
+                }
+            }
+        }
+
+        var first = FirstSeq;
+        var evictedBeforeFirst = first > 1; // something once existed before the oldest retained entry
         bool truncated;
+        long oldestRetainedTs = entries.Count > 0 ? entries.Min(e => e.TimestampMs) : long.MaxValue;
 
         if (from?.Seq is { } seq)
         {
@@ -95,11 +155,10 @@ public sealed class ReplayLog<T>
             {
                 if (e.Seq >= seq) entries.Add(e with { Item = _copy(e.Item) });
             }
-            truncated = evicted > 0 && seq < FirstSeq;
+            truncated = evictedBeforeFirst && seq < first;
         }
         else if (from?.TimestampMs is { } ts)
         {
-            long oldestRetainedTs = long.MaxValue;
             foreach (var (e, _) in _ring)
             {
                 oldestRetainedTs = Math.Min(oldestRetainedTs, e.TimestampMs);
@@ -107,7 +166,7 @@ public sealed class ReplayLog<T>
             }
             // Evicted entries' timestamps are gone; if the request reaches at or below the oldest
             // retained event time, an evicted entry could have matched — say so rather than guess.
-            truncated = evicted > 0 && (_ring.Count == 0 || ts <= oldestRetainedTs);
+            truncated = evictedBeforeFirst && (oldestRetainedTs == long.MaxValue || ts <= oldestRetainedTs);
         }
         else
         {
@@ -115,10 +174,10 @@ public sealed class ReplayLog<T>
             {
                 entries.Add(e with { Item = _copy(e.Item) });
             }
-            truncated = evicted > 0;
+            truncated = evictedBeforeFirst;
         }
 
-        return new ReplaySnapshot<T>(entries, FirstSeq, LastSeq, TotalSeen, truncated);
+        return new ReplaySnapshot<T>(entries, first, LastSeq, TotalSeen, truncated);
     }
 
     private void EvictAged(long nowMs)

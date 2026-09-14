@@ -34,6 +34,7 @@ public static class DaprFacadesExtensions
 {
     public static IServiceCollection AddDaprFacades(this IServiceCollection services)
     {
+        services.AddSingleton<IReplayStatusFacade, StubReplayStatusFacade>(); // plan 026 D6 — 501 on this flavor
         // Plan 021: ICatalogFacade stops being a singleton that resolves ONE registry actor proxy at
         // container-build time (that resolved to the default environment forever, no matter what a later
         // request's X-StreamsForge-Environment header said). ICatalogFacadeFactory is the singleton now —
