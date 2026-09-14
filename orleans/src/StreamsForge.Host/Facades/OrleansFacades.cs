@@ -1,5 +1,4 @@
 using Orleans;
-using Orleans.Streams;
 using StreamsForge.Abstractions;
 using StreamsForge.AppCore.Environments;
 using StreamsForge.AppCore.Ingest;
@@ -365,31 +364,30 @@ internal sealed class OrleansIngressFacade(
         client.RegistryFor(EnvironmentAmbient.Current).GetSourceAsync(sourceName);
 
     /// <summary>The drain pump handed to every <see cref="SourceIngressBuffer"/> this facade creates:
-    /// one <c>OnNextAsync</c> per row, into the ingest source's own stream identity — so it fans out to
-    /// every existing consumer unchanged.
+    /// plan 026 D3 routes the whole batch through <see cref="IIngestSourceGrain.PublishAsync"/> — one
+    /// grain call per drained batch, one <c>EventRecord</c> published per row inside it — instead of a
+    /// direct <c>stream.OnNextAsync</c> loop, so the late-consumer attach gate and the replay log have a
+    /// turn-based owner. <paramref name="qualifiedName"/> IS the grain's key, which is also this
+    /// source's stream identity (<c>EnvKeys.Qualify(def.Environment, sourceName)</c>, captured by
+    /// PushCoreAsync's closure) — matching TableGrain/PipelineGrain's subscription to the SAME
+    /// (SourcesNamespace, qualifiedName) stream, so a row published through the grain fans out to every
+    /// existing consumer unchanged.
     ///
     /// Also where the SECOND loss point (IngestModels.cs's header) is measured: under
     /// <c>Streams:Transport=push</c>, <see cref="PushStreamBus.TotalDropped"/> advances synchronously
-    /// inside each <c>OnNextAsync</c> (a full subscriber channel drops the item right there), so the
-    /// pre/post delta across this batch is an honest — if approximate under concurrent ingest sources
-    /// sharing the one process-wide counter — attribution back to THIS source's
-    /// <see cref="IngestStatus.DownstreamDropped"/>. <see cref="PushStreamBus"/> isn't registered at
-    /// all under the default pull (memory-streams) transport, so DownstreamDropped simply stays 0
-    /// there — pull's own loss point (pulling-agent queue overflow) isn't instrumented today.</summary>
+    /// inside each <c>OnNextAsync</c> the grain performs — the co-hosted silo means this before/after
+    /// read still brackets the same publish, only now across one grain hop, so the delta stays an
+    /// honest — if approximate under concurrent ingest sources sharing the one process-wide counter —
+    /// attribution back to THIS source's <see cref="IngestStatus.DownstreamDropped"/>.
+    /// <see cref="PushStreamBus"/> isn't registered at all under the default pull (memory-streams)
+    /// transport, so DownstreamDropped simply stays 0 there — pull's own loss point (pulling-agent
+    /// queue overflow) isn't instrumented today.</summary>
     private async Task DrainAsync(string qualifiedName, IReadOnlyList<Dictionary<string, object?>> rows, CancellationToken ct)
     {
         var pushBus = services.GetService<PushStreamBus>();
         var before = pushBus?.TotalDropped ?? 0;
 
-        // qualifiedName (EnvKeys.Qualify(def.Environment, sourceName), captured by PushCoreAsync's closure)
-        // is also this source's own stream identity — matching TableGrain/PipelineGrain's subscription to
-        // (SourcesNamespace, EnvKeys.Qualify(def.Environment, sourceName)) for the SAME source.
-        var stream = client.GetStreamProvider(StreamConstants.ProviderName)
-            .GetStream<EventRecord>(StreamId.Create(StreamConstants.SourcesNamespace, qualifiedName));
-        foreach (var record in IngressEnvelopeBuilder.ToEventRecords(rows))
-        {
-            await stream.OnNextAsync(record);
-        }
+        await client.GetGrain<IIngestSourceGrain>(qualifiedName).PublishAsync(rows.ToList());
 
         if (pushBus is null)
         {
