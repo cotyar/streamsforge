@@ -33,6 +33,7 @@ const USAGE = `sf — StreamsForge admin CLI
   sf environments rm <name> [--force] [--yes]
   sf ls <${KINDS.join("|")}>            one line per entity (--json for the raw array)
   sf get <kind> <id>                         one entity's full definition
+  sf replay <kind> <id>                      replay-log status: retained positions, memory + disk (plan 026)
   sf start|stop <pipelines|tables> <id>      lifecycle
   sf create <kind> -f <def.json>             create from the JSON the REST API takes
   sf delete <kind> <id> [--yes]              delete (asks first unless --yes)
@@ -461,6 +462,13 @@ async function main(argv: string[]): Promise<number> {
 
     case "get":
       out(await client.get(requireKind(positional[1]), required(positional[2], "id")), json);
+      return 0;
+
+    // Plan 026 wave 3 D6: what this entity's replay log currently retains (memory + disk). Same
+    // shape as `get` above — GET /api/{kind}/{id}/replay is uniform across all three kinds, unlike
+    // `rows`/`results` which are table/pipeline-specific.
+    case "replay":
+      out(await client.replay(requireKind(positional[1]), required(positional[2], "id")), json);
       return 0;
 
     case "start":

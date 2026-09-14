@@ -82,7 +82,13 @@ public static class ConfigSerializer
     /// <c>schemaRevision</c> — is a DEFINITION change that bumps <c>Revision</c>. Deliberate: a pin is
     /// part of what the entity IS, the same way its SQL or its sinks are. Verified not to disturb the
     /// "an identical round-trip plans as skipped" property, because an unchanged pin list still
-    /// canonicalizes identically.</para></summary>
+    /// canonicalizes identically.</para>
+    ///
+    /// <para><b>Plan 026 wave 3: also carries <see cref="PipelineDefinition.ReplayFrom"/>/
+    /// <see cref="PipelineDefinition.Replay"/>.</b> Wave 2 left these out of the projection, so a
+    /// <c>replayFrom</c>-only edit restarted the pipeline (the grain applies it directly) without ever
+    /// bumping <c>Revision</c> — found and documented, not fixed, in plan 026's wave 2 outcomes. Adding
+    /// them here closes that gap the same way DependsOn closed it for pins.</para></summary>
     internal static ConfigPipeline ToConfigPipeline(PipelineDefinition p, bool includeSecrets = true) => new()
     {
         Name = p.Name,
@@ -93,6 +99,8 @@ public static class ConfigSerializer
         Metadata = new Dictionary<string, string>(p.Metadata),
         Sinks = includeSecrets ? [.. p.Sinks] : SecretsMasker.MaskSinks(p.Sinks),
         DependsOn = [.. p.DependsOn],
+        ReplayFrom = new Dictionary<string, ReplayFrom>(p.ReplayFrom),
+        Replay = p.Replay,
     };
 
     /// <summary>Catalog TableDefinition -&gt; ConfigTable mapping — same Running rule as
@@ -101,7 +109,12 @@ public static class ConfigSerializer
     ///
     /// <para>Plan 016 wave 3-B: carries <see cref="TableDefinition.DependsOn"/> — see the identical
     /// Revision-bump note on <see cref="ToConfigPipeline"/>, which applies here via
-    /// <c>CatalogRevisions.TableCanonicalText</c> the same way.</para></summary>
+    /// <c>CatalogRevisions.TableCanonicalText</c> the same way.</para>
+    ///
+    /// <para>Plan 026 wave 3: also carries <see cref="TableDefinition.ReplayFrom"/>/
+    /// <see cref="TableDefinition.Replay"/> — see the identical note on <see cref="ToConfigPipeline"/>.
+    /// <c>SchemaRevision</c> is untouched either way: it moves only on an <c>OutputFields</c> shape
+    /// change (<c>CatalogRevisions.BumpTable</c>), and replay is not shape.</para></summary>
     internal static ConfigTable ToConfigTable(TableDefinition t, bool includeSecrets = true) => new()
     {
         Name = t.Name,
@@ -123,5 +136,7 @@ public static class ConfigSerializer
         Parallelism = t.Parallelism,
         Sinks = includeSecrets ? [.. t.Sinks] : SecretsMasker.MaskSinks(t.Sinks),
         DependsOn = [.. t.DependsOn],
+        ReplayFrom = new Dictionary<string, ReplayFrom>(t.ReplayFrom),
+        Replay = t.Replay,
     };
 }

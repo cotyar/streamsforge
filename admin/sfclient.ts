@@ -403,6 +403,14 @@ export class SfClient {
     return this.request("GET", `/api/${kind}/${encodeURIComponent(id)}/metrics`);
   }
 
+  /** Plan 026 wave 3 D6: GET /api/{kind}/{id}/replay — what this entity's replay log currently
+   * retains (memory + disk). Same route shape for all three kinds, unlike metrics() above (which
+   * special-cases sources onto /status) — /replay is uniform. 501 on the Dapr flavor (no log yet,
+   * dapr/PARITY.md D11) surfaces through request()'s ordinary SfError, message included verbatim. */
+  replay(kind: Kind, id: string): Promise<unknown> {
+    return this.request("GET", `/api/${kind}/${encodeURIComponent(id)}/replay`);
+  }
+
   /** Compiles SQL without creating anything — the check to run before committing to a definition. */
   validate(kind: "pipelines" | "tables", sql: string): Promise<unknown> {
     return this.request("POST", `/api/${kind}/validate`, { body: { sql } });

@@ -90,6 +90,19 @@ public sealed class ConfigPipeline
     /// export exactly like every other empty list here, so a document that declares no pins is byte-
     /// identical to one written before this field existed.</summary>
     public List<EntityPin> DependsOn { get; set; } = [];
+
+    /// <summary>Plan 026 wave 3: mirrors <see cref="PipelineDefinition.ReplayFrom"/> — keyed by input
+    /// name, where each stream input starts when this pipeline (re)starts. Empty (the default) is pruned
+    /// from an export exactly like every other empty collection here. Carrying it here is what closes
+    /// wave 2's found-and-not-fixed gap: without it, editing only <c>replayFrom</c> compared equal under
+    /// <c>CatalogRevisions.PipelineCanonicalText</c> and never bumped <c>Revision</c> even though the
+    /// entity really did restart.</summary>
+    public Dictionary<string, ReplayFrom> ReplayFrom { get; set; } = [];
+
+    /// <summary>Plan 026 wave 3: mirrors <see cref="PipelineDefinition.Replay"/> — disk-backed retention
+    /// for this pipeline's result-batch log. Null (the default) is pruned from an export like any other
+    /// null field.</summary>
+    public ReplayConfig? Replay { get; set; }
 }
 
 /// <summary>
@@ -143,4 +156,15 @@ public sealed class ConfigTable
     /// export exactly like every other empty list here, so a document that declares no pins is byte-
     /// identical to one written before this field existed.</summary>
     public List<EntityPin> DependsOn { get; set; } = [];
+
+    /// <summary>Plan 026 wave 3: mirrors <see cref="TableDefinition.ReplayFrom"/> — keyed by input name,
+    /// where each source/pipeline input starts when this table (re)starts. Empty (the default) is pruned
+    /// from an export like every other empty collection here — see the identical note on
+    /// <see cref="ConfigPipeline.ReplayFrom"/> for why this closes wave 2's found-and-not-fixed gap.</summary>
+    public Dictionary<string, ReplayFrom> ReplayFrom { get; set; } = [];
+
+    /// <summary>Plan 026 wave 3: mirrors <see cref="TableDefinition.Replay"/> — disk-backed retention for
+    /// this table's delta-batch log. Null (the default) is pruned from an export like any other null
+    /// field.</summary>
+    public ReplayConfig? Replay { get; set; }
 }

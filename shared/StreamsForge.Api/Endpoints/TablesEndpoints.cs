@@ -518,6 +518,36 @@ public static class TablesEndpoints
             return Results.Ok(metrics);
         }).RequireAuthorization("Viewer");
 
+        // GET /{id}/replay — plan 026 wave 3 D6: what this table's delta-batch replay log currently
+        // retains (memory + disk). id-or-name via EntityLookup, same as every other GET route in this
+        // file — the facade itself is keyed by table NAME (IReplayStatusFacade.GetTableAsync's own doc;
+        // tables have no separate grain/actor key), which is why def.Name, not def.Id, is passed through.
+        // NotSupportedException (Dapr, until PARITY D11 closes) becomes 501 rather than a bare 500.
+        group.MapGet("/{id}/replay", async (string id, ClaimsPrincipal principal, AccessGuard guard, ICatalogFacade registry, IReplayStatusFacade replay) =>
+        {
+            var hit = await EntityLookup.TableAsync(registry, id);
+            if (await RefuseAsync(guard, principal, Actions.TableRead, hit.Value?.Name ?? id, hit.Value?.Tags) is { } refusal)
+            {
+                return refusal;
+            }
+
+            if (EntityLookup.Reject(hit) is { } miss)
+            {
+                return miss;
+            }
+
+            var def = hit.Value!;
+            try
+            {
+                var status = await replay.GetTableAsync(def.Name);
+                return status is null ? Results.NotFound() : Results.Ok(status);
+            }
+            catch (NotSupportedException ex)
+            {
+                return Results.Json(new ErrorResponse(ex.Message), statusCode: StatusCodes.Status501NotImplemented);
+            }
+        }).RequireAuthorization("Viewer");
+
         // Downloadable, self-contained .proto for this table: DescriptorFactory's schema (built from
         // the already-compiled TableDefinition.OutputFields, no recompilation needed) plus the
         // DynamicStreamService streaming contract. 409 if the table has never successfully compiled

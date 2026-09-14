@@ -124,6 +124,13 @@ internal sealed class RvSubscription(RvSubConfig cfg) : IInboundSubscription
   an exception out of `SubscribeAsync` counts as a connection failure.
 - Ack is called only on a clean outcome, so a message rejected by coercion is redelivered if your transport
   has redelivery.
+- **Stream replay (plan 026), free of any code in your transport.** Whatever `ConnectorGrain` publishes
+  onto the source's stream also lands in that source's `ReplayLog` behind the shared `ReplayGate` —
+  the same one-line dispatch through `InboundTransports.Find(kind)` above is what makes this automatic.
+  A late-attaching consumer, a `GET /api/sources/{name}/replay` status read, and a `replayFrom: {seq:…}`
+  gRPC/SignalR subscription all work for your kind the moment it registers, with nothing transport-
+  specific to opt into. Opting a *definition* of your kind into `replay: { persist: true }` similarly
+  needs no transport code — the disk-backed tier lives at the grain/log layer, entirely below `Open`.
 
 **Contract you must honor:** `SubscribeAsync` must respect `ct` at every await, and must not swallow
 connection errors — throwing is how you ask for a reconnect.
