@@ -543,7 +543,9 @@ public sealed class RegistryGrain(
         // dictionary that also carries pipelines. Table-over-pipeline is one-directional by construction:
         // that is the whole reason no cycle is possible (a pipeline cannot read a table either), which is
         // why nothing here needs the cycle check table-over-table has.
-        ApplyPipelineCompileResult(def, SqlCompiler.Compile(def.Sql, BuildStreamSchemas()));
+        var createCompile = SqlCompiler.Compile(def.Sql, BuildStreamSchemas());
+        ValidateReplayFrom("pipeline", def.ReplayFrom, createCompile.Ok, createCompile.SourceNames, []);
+        ApplyPipelineCompileResult(def, createCompile);
 
         state.State.Pipelines.Add(def);
         // Table-over-pipeline: a pipeline APPEARING can make a table that never compiled compile — the
@@ -572,12 +574,16 @@ public sealed class RegistryGrain(
         ValidateUniquePipelineName(def.Name, excludePipelineId: existing.Id);
 
         var sqlChanged = existing.Sql != def.Sql;
+        // Plan 026 D5: executor-affecting exactly like the SQL — replayFrom is applied when the executor is
+        // built (StartAsync) and nowhere else, so a change to it on a Running pipeline restarts it.
+        var replayFromChanged = !ReplayFromEquals(existing.ReplayFrom, def.ReplayFrom);
         var wasRunning = existing.Status == PipelineStatus.Running;
 
         // Compile-check against the prospective SQL before anything is stored — draft-friendly like
         // tables' CompileTableSql/ApplyCompileResult pair: never blocks the update on its own, only
         // populates/clears SourceNames.
         var compileResult = SqlCompiler.Compile(def.Sql, BuildStreamSchemas());
+        ValidateReplayFrom("pipeline", def.ReplayFrom, compileResult.Ok, compileResult.SourceNames, []);
 
         // See CarryServerOwnedFields' doc comment: the incoming definition IS the new record, with only
         // the server-owned fields carried over from the stored one — rather than a hand-written list of
@@ -606,7 +612,7 @@ public sealed class RegistryGrain(
         }
         RecomputeStaleReasons();
 
-        if (sqlChanged && wasRunning)
+        if ((sqlChanged || replayFromChanged) && wasRunning)
         {
             var pipelineGrain = GrainFactory.GetGrain<IPipelineGrain>(EnvKeys.Qualify(_env, def.Id));
             try
@@ -741,6 +747,7 @@ public sealed class RegistryGrain(
         ValidateHistoryConfig(def, compileResult);
         ValidateRetention(def, compileResult);
         ValidateShardBy(def, compileResult);
+        ValidateReplayFrom("table", def.ReplayFrom, compileResult.Ok, compileResult.StreamInputs, compileResult.TableInputs);
         ApplyCompileResult(def, compileResult);
 
         state.State.Tables.Add(def);
@@ -799,6 +806,7 @@ public sealed class RegistryGrain(
         ValidateHistoryConfig(def, compileResult);
         ValidateRetention(def, compileResult);
         ValidateShardBy(def, compileResult);
+        ValidateReplayFrom("table", def.ReplayFrom, compileResult.Ok, compileResult.StreamInputs, compileResult.TableInputs);
 
         var sqlChanged = existing.Sql != def.Sql;
         var searchChanged = existing.SearchEnabled != def.SearchEnabled || existing.SearchMode != def.SearchMode;
@@ -821,6 +829,11 @@ public sealed class RegistryGrain(
         // next manual stop/start.
         var retentionChanged = existing.RetentionMaxRows != def.RetentionMaxRows
             || existing.RetentionTtlMs != def.RetentionTtlMs;
+        // Plan 026 D5: replayFrom is applied at StartAsync and nowhere else (a replay only targets a FRESH
+        // executor — into a live one every replayed row is a late event), so it has exactly the
+        // "only picked up on (re)start" property retention and the fields above it have — restart for the
+        // same reason, so setting or clearing a position on a Running table takes effect now.
+        var replayFromChanged = !ReplayFromEquals(existing.ReplayFrom, def.ReplayFrom);
         // Plan 011 D1: a ShardBy change re-keys the entire shard tier (or turns it on/off), so it resets
         // the tier below. Plan 011 D2 additionally RESTARTS the table, which D1 explicitly did not: the
         // tier is still only a delta-stream consumer and the grain topology is still unaffected, but
@@ -876,7 +889,7 @@ public sealed class RegistryGrain(
         // (re)StartAsync — mirror the SQL-changed restart below for search config, parallelism, and
         // persistence too, so toggling SearchEnabled/SearchMode/Parallelism/Persistence/FlushMs on a
         // Running table takes effect immediately instead of only on the next manual stop/start.
-        if ((sqlChanged || searchChanged || parallelismChanged || persistenceChanged || retentionChanged || shardByChanged) && wasRunning)
+        if ((sqlChanged || searchChanged || parallelismChanged || persistenceChanged || retentionChanged || shardByChanged || replayFromChanged) && wasRunning)
         {
             var tableGrain = GrainFactory.GetGrain<ITableGrain>(EnvKeys.Qualify(_env, def.Name));
             try
@@ -1115,6 +1128,58 @@ public sealed class RegistryGrain(
     /// Draft-friendly in exactly the way <see cref="ValidateHistoryConfig"/> is: SQL that does not compile
     /// is not rejected here (the table is saved as a draft with diagnostics, as always) — the shape check
     /// simply has nothing to check yet and re-runs on the next update that does compile.</summary>
+    /// <summary>Plan 026 D5: every key of <c>ReplayFrom</c> must name one of this entity's compiled STREAM
+    /// or PIPELINE inputs — the set <paramref name="streamInputs"/> carries (a table's
+    /// <c>TableCompileResult.StreamInputs</c> already mixes sources and pipelines; a pipeline's is its
+    /// <c>SourceNames</c>). Three refusals, each with its reason:
+    ///  * a TABLE input — those rows arrive through plan 023's backfill snapshot, which has no position;
+    ///  * a name that is no input of this entity at all, answered WITH the valid names, because the
+    ///    commonest mistake is a pipeline's ID where its NAME belongs (the dictionary is keyed by name);
+    ///  * a <c>crdt</c>-kind source — a CRDT document keeps its own replay (plan 020's <c>ReplayAsync</c>)
+    ///    and is not in any <c>ReplayLog</c>, so a position on it could only ever be silently ignored.
+    ///
+    /// Draft-friendly exactly like <see cref="ValidateRetention"/>/<see cref="ValidateShardBy"/>: SQL that
+    /// does not compile has no input set to check against, so this re-runs on the next update that does.
+    /// An empty dictionary — the default — costs one <c>Count</c>.</summary>
+    private void ValidateReplayFrom(
+        string entityKind, IReadOnlyDictionary<string, ReplayFrom> replayFrom, bool compiled,
+        IReadOnlyList<string> streamInputs, IReadOnlyList<string> tableInputs)
+    {
+        if (replayFrom.Count == 0 || !compiled)
+        {
+            return;
+        }
+
+        foreach (var input in replayFrom.Keys)
+        {
+            if (tableInputs.Contains(input, StringComparer.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"replayFrom names table input '{input}': a table input replays through the backfill snapshot; a position on a table input is wave 3 work.");
+            }
+
+            if (!streamInputs.Contains(input, StringComparer.Ordinal))
+            {
+                var valid = streamInputs.Count == 0 ? "(none)" : string.Join(", ", streamInputs);
+                throw new InvalidOperationException(
+                    $"replayFrom names '{input}', which is not an input of this {entityKind}. Valid inputs: {valid}.");
+            }
+
+            var source = state.State.Sources.FirstOrDefault(s => string.Equals(s.Name, input, StringComparison.Ordinal));
+            if (source is not null && SourceKindDispatch.Classify(source.Kind) == SourceKindDispatch.ActorKind.Crdt)
+            {
+                throw new InvalidOperationException(
+                    $"replayFrom names crdt source '{input}': crdt sources replay through their own ReplayAsync.");
+            }
+        }
+    }
+
+    /// <summary>Value equality for a <c>ReplayFrom</c> map — key set plus each entry's Seq/TimestampMs
+    /// (<see cref="ReplayFrom"/> is a record, so <c>==</c> is already by value). Used to decide whether an
+    /// update changed an executor-affecting field; reference equality would call every update a change.</summary>
+    private static bool ReplayFromEquals(IReadOnlyDictionary<string, ReplayFrom> a, IReadOnlyDictionary<string, ReplayFrom> b) =>
+        a.Count == b.Count && a.All(kv => b.TryGetValue(kv.Key, out var other) && kv.Value == other);
+
     private static void ValidateRetention(TableDefinition def, TableCompileResult compileResult)
     {
         if (def.RetentionMaxRows < 0 || def.RetentionTtlMs < 0)

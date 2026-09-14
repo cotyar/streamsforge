@@ -5,6 +5,7 @@ using StreamsForge.AppCore.Environments;
 using StreamsForge.Engine;
 using StreamsForge.Engine.Dataflow;
 using StreamsForge.Host.Facades;
+using StreamsForge.Host.Streaming;
 
 namespace StreamsForge.Host.Grains;
 
@@ -100,15 +101,13 @@ public sealed class TableIngestGrain : Grain, ITableIngestGrain
         {
             // Table-over-pipeline: a stream input whose name belongs to a PIPELINE reads a different
             // namespace with a different payload, keyed by the pipeline's ID — split off before the source
-            // path, the same way TableGrain.StartClassicAsync splits it. No attach protocol: a pipeline has
-            // no replay ring (see PipelineInputs' class doc), so this is a plain subscribe.
+            // path, the same way TableGrain.StartClassicAsync splits it. Plain subscribe unless plan 026
+            // D5's replayFrom names it, in which case the pipeline's own result-batch gate replays it —
+            // TableGrain.SubscribeToPipelineInputAsync is the Parallelism == 1 twin of this.
             var pipeline = await PipelineInputs.FindAsync(GrainFactory, def.Environment, inputName);
             if (pipeline is not null)
             {
-                var stream = streamProvider.GetStream<List<ResultEnvelope>>(
-                    StreamId.Create(StreamConstants.OutputNamespace, PipelineInputs.OutputStreamKey(def.Environment, pipeline)));
-                _pipelineSub = await stream.SubscribeAsync((batch, _) => OnPipelineBatchAsync(batch));
-                _status = PipelineStatus.Running;
+                await AttachToPipelineInputAsync(streamProvider, def, inputName, pipeline);
             }
             else
             {
@@ -133,18 +132,28 @@ public sealed class TableIngestGrain : Grain, ITableIngestGrain
     private async Task AttachToStreamSourceAsync(
         IStreamProvider streamProvider, TableDefinition def, string inputName, string qualifiedInputName)
     {
-        IConnectorGrain? connector = null;
+        IReplayableSourceGrain? connector = null;
         SourceReplaySnapshot? snapshot = null;
+        // Plan 026 D5 — same rule as the Parallelism == 1 twin: a NAMED input replays from its position
+        // through the kind-dispatched driver (generator and ingest included); an unnamed one keeps plan
+        // 023's connector-only default attach verbatim.
+        var from = ReplayInputs.For(def.ReplayFrom, inputName);
 
         // GetSourceAsync is on RegistryGrain's [MayInterleave] allowlist (verified), so calling it from here
         // is safe even when the registry is itself awaiting the TableGrain.StartAsync that led to this call.
         try
         {
             var sourceDef = await GrainFactory.RegistryFor(def.Environment).GetSourceAsync(inputName);
-            if (sourceDef is not null && SourceKindDispatch.Classify(sourceDef.Kind) == SourceKindDispatch.ActorKind.Connector)
+            if (sourceDef is not null && from is not null)
             {
-                connector = GrainFactory.GetGrain<IConnectorGrain>(qualifiedInputName);
-                snapshot = await connector.BeginAttachAsync();
+                connector = ReplayInputs.DriverFor(GrainFactory, sourceDef.Kind, qualifiedInputName);
+                snapshot = connector is null ? null : await connector.BeginAttachAsync(from);
+            }
+            else if (sourceDef is not null && SourceKindDispatch.Classify(sourceDef.Kind) == SourceKindDispatch.ActorKind.Connector)
+            {
+                var driver = GrainFactory.GetGrain<IConnectorGrain>(qualifiedInputName);
+                connector = driver;
+                snapshot = await driver.BeginAttachAsync();
             }
         }
         catch
@@ -174,6 +183,58 @@ public sealed class TableIngestGrain : Grain, ITableIngestGrain
             if (connector is not null)
             {
                 try { await connector.EndAttachAsync(); } catch { /* the source's own safety timer covers it */ }
+            }
+        }
+    }
+
+    /// <summary>Plan 026 D5 — the Parallelism &gt;= 2 twin of <c>TableGrain.SubscribeToPipelineInputAsync</c>:
+    /// plain subscribe unless <see cref="TableDefinition.ReplayFrom"/> names this pipeline, in which case
+    /// Begin(from) → subscribe → feed the retained batches through the same
+    /// <see cref="OnPipelineBatchAsync"/> handler → End in a <c>finally</c>. <see cref="_status"/> goes
+    /// Running before the replay is fed, for the reason the source twin documents: the handler no-ops while
+    /// Stopped and the replayed rows would be dropped on the floor.</summary>
+    private async Task AttachToPipelineInputAsync(
+        IStreamProvider streamProvider, TableDefinition def, string inputName, PipelineDefinition pipeline)
+    {
+        var key = PipelineInputs.OutputStreamKey(def.Environment, pipeline);
+        var from = ReplayInputs.For(def.ReplayFrom, inputName);
+
+        IPipelineGrain? driver = null;
+        StreamReplaySnapshot<List<ResultEnvelope>>? snapshot = null;
+        if (from is not null)
+        {
+            try
+            {
+                driver = GrainFactory.GetGrain<IPipelineGrain>(key);
+                snapshot = await driver.BeginAttachAsync(from);
+            }
+            catch
+            {
+                // Best-effort, exactly like the source path.
+                driver = null;
+                snapshot = null;
+            }
+        }
+
+        try
+        {
+            var stream = streamProvider.GetStream<List<ResultEnvelope>>(StreamId.Create(StreamConstants.OutputNamespace, key));
+            _pipelineSub = await stream.SubscribeAsync((batch, _) => OnPipelineBatchAsync(batch));
+            _status = PipelineStatus.Running;
+
+            if (snapshot is not null)
+            {
+                foreach (var batch in snapshot.Items)
+                {
+                    await OnPipelineBatchAsync(batch);
+                }
+            }
+        }
+        finally
+        {
+            if (driver is not null)
+            {
+                try { await driver.EndAttachAsync(); } catch { /* the pipeline's own safety timer covers it */ }
             }
         }
     }

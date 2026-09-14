@@ -139,21 +139,37 @@ public sealed class PipelineGrain(ILogger<PipelineGrain> logger) : Grain, IPipel
     /// which point anything the source produced meanwhile is delivered — to this subscription too. Nothing
     /// is replayed and delivered twice; nothing falls in the gap. Only
     /// <see cref="SourceKindDispatch.ActorKind.Connector"/> sources have that driver — generators, ingest
-    /// sources and CRDT documents are subscribed to exactly as before.</summary>
+    /// sources and CRDT documents are subscribed to exactly as before.
+    ///
+    /// <para>PLAN 026 D5 — a source NAMED in <see cref="PipelineDefinition.ReplayFrom"/> attaches from that
+    /// POSITION instead, generators and ingest sources included. It happens here, inside StartAsync and
+    /// BEFORE <c>_timer</c> (the wall-clock watermark tick) is armed, which is what keeps the replayed rows
+    /// out of <c>PipelineMetrics.LateEvents</c>: the fresh executor's watermark is still 0 while they are
+    /// fed, and only the first tick after StartAsync returns pulls it up to the wall clock.</para></summary>
     private async Task AttachToSourceAsync(
         IStreamProvider streamProvider, PipelineDefinition def, string sourceName, IEnumerable<SourceDefinition> sources)
     {
         var qualified = EnvKeys.Qualify(def.Environment, sourceName);
+        var from = ReplayInputs.For(def.ReplayFrom, sourceName);
 
         var sourceDef = sources.FirstOrDefault(s => s.Name == sourceName);
-        IConnectorGrain? connector = null;
+        IReplayableSourceGrain? connector = null;
         SourceReplaySnapshot? snapshot = null;
-        if (sourceDef is not null && SourceKindDispatch.Classify(sourceDef.Kind) == SourceKindDispatch.ActorKind.Connector)
+        if (sourceDef is not null)
         {
-            connector = GrainFactory.GetGrain<IConnectorGrain>(qualified);
             try
             {
-                snapshot = await connector.BeginAttachAsync();
+                if (from is not null)
+                {
+                    connector = ReplayInputs.DriverFor(GrainFactory, sourceDef.Kind, qualified);
+                    snapshot = connector is null ? null : await connector.BeginAttachAsync(from);
+                }
+                else if (SourceKindDispatch.Classify(sourceDef.Kind) == SourceKindDispatch.ActorKind.Connector)
+                {
+                    var driver = GrainFactory.GetGrain<IConnectorGrain>(qualified);
+                    connector = driver;
+                    snapshot = await driver.BeginAttachAsync();
+                }
             }
             catch (Exception ex)
             {
@@ -171,7 +187,16 @@ public sealed class PipelineGrain(ILogger<PipelineGrain> logger) : Grain, IPipel
 
             if (snapshot is not null && snapshot.Rows.Count > 0)
             {
-                if (snapshot.TotalSeen > snapshot.Rows.Count)
+                if (from is not null)
+                {
+                    // See TableGrain's twin: a deliberate position that outran retention gets its own line,
+                    // never the default attach's "earlier rows are not recoverable".
+                    if (snapshot.Truncated)
+                    {
+                        ReplayInputs.WarnTruncated(logger, def.Name, sourceName, snapshot.FirstSeq);
+                    }
+                }
+                else if (snapshot.TotalSeen > snapshot.Rows.Count)
                 {
                     logger.LogWarning(
                         "Pipeline '{Pipeline}': late attach to source '{Source}' replayed {Replayed} of {TotalSeen} row(s); " +

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Orleans.Streams;
 using StreamsForge.Abstractions;
 using StreamsForge.AppCore.Streaming;
@@ -109,4 +110,40 @@ internal sealed class ReplayGate<T>(
             _log.Append(item);
         }
     }
+}
+
+/// <summary>Plan 026 D5 — the CONSUMER half of <c>replayFrom</c>, shared by the three grains that attach to
+/// an input (<see cref="Grains.TableGrain"/>, <see cref="Grains.PipelineGrain"/>,
+/// <see cref="Grains.TableIngestGrain"/>): which position an input starts from, and which driver grain to
+/// ask for it.</summary>
+internal static class ReplayInputs
+{
+    /// <summary>The position declared for <paramref name="inputName"/>, or null when the definition names
+    /// no position for it — which is what keeps an unnamed input byte-for-byte on its pre-026 attach path.
+    /// A present-but-empty entry counts as unnamed (nothing was actually asked for).</summary>
+    public static ReplayFrom? For(IReadOnlyDictionary<string, ReplayFrom> replayFrom, string inputName) =>
+        replayFrom.TryGetValue(inputName, out var from) && from is { IsEmpty: false } ? from : null;
+
+    /// <summary>The source driver that owns the replay log for <paramref name="kind"/> — connector,
+    /// generator AND ingest, unlike the default attach path, which is connector-only by decision (a new
+    /// table over a seeded generator must not suddenly receive its whole ring). <c>crdt</c> and any
+    /// unrecognized kind answer null: <c>RegistryGrain</c> refuses <c>replayFrom</c> on those, so null here
+    /// only covers a catalog edited around that guard, and the caller then subscribes live rather than
+    /// refusing to start.</summary>
+    public static IReplayableSourceGrain? DriverFor(IGrainFactory grains, string? kind, string qualifiedName) =>
+        SourceKindDispatch.Classify(kind) switch
+        {
+            SourceKindDispatch.ActorKind.Connector => grains.GetGrain<IConnectorGrain>(qualifiedName),
+            SourceKindDispatch.ActorKind.Generator => grains.GetGrain<IGeneratorGrain>(qualifiedName),
+            SourceKindDispatch.ActorKind.Ingest => grains.GetGrain<IIngestSourceGrain>(qualifiedName),
+            _ => null,
+        };
+
+    /// <summary>The one warning shape for "you asked for a position the producer no longer retains" — never
+    /// silence, the same rule the <c>WarmUpstreamDiagnostic</c> warning follows. Each placeholder name
+    /// appears exactly once (the structured-logging formatter binds positionally).</summary>
+    public static void WarnTruncated(ILogger logger, string entity, string inputName, long firstSeq) =>
+        logger.LogWarning(
+            "'{Entity}': replayFrom for input '{Input}' reached past what the producer retains; replayed from position {FirstSeq}.",
+            entity, inputName, firstSeq);
 }
