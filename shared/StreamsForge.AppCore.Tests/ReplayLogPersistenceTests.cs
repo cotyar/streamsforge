@@ -148,4 +148,14 @@ public sealed class ReplayLogPersistenceTests : IDisposable
         Assert.Equal(-1, deltas[0].Weight);
         Assert.Equal(1.5d, Assert.IsType<double>(deltas[0].Row["d"]));
     }
+
+    [Fact]
+    public void An_integral_double_round_trips_as_a_double_not_a_long()
+    {
+        var row = new Dictionary<string, object?> { ["px"] = 100.0d, ["qty"] = 7L, ["neg"] = -3.0d };
+        var back = ReplayPayloadJson.Deserialize<Dictionary<string, object?>>(ReplayPayloadJson.Serialize(row));
+        Assert.Equal(100.0d, Assert.IsType<double>(back["px"]));
+        Assert.Equal(-3.0d, Assert.IsType<double>(back["neg"]));
+        Assert.Equal(7L, Assert.IsType<long>(back["qty"]));
+    }
 }

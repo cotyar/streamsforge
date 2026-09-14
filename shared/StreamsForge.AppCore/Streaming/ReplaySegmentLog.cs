@@ -359,7 +359,28 @@ public sealed class ReplaySegmentLog : IDisposable
 /// (<c>2.0</c>) is written as <c>2</c> and read back as <c>long</c>. Fractional doubles round-trip.</para></summary>
 public static class ReplayPayloadJson
 {
-    private static readonly JsonSerializerOptions Options = new();
+    private static readonly JsonSerializerOptions Options = new() { Converters = { new IntegralDoubleConverter() } };
+
+    /// <summary>JSON has one number type and System.Text.Json writes the double <c>2.0</c> as <c>2</c>, which
+    /// <see cref="JsonValueNormalizer"/> reads back as a long — a pipeline column would change CLR type across
+    /// a restart. Writing integral doubles with an explicit <c>.0</c> keeps the reader's long/double split
+    /// exactly what the producer had; nothing else about the number changes.</summary>
+    private sealed class IntegralDoubleConverter : System.Text.Json.Serialization.JsonConverter<double>
+    {
+        public override double Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) => reader.GetDouble();
+
+        public override void Write(Utf8JsonWriter writer, double value, JsonSerializerOptions options)
+        {
+            if (double.IsFinite(value) && value == Math.Floor(value) && Math.Abs(value) < 1e15)
+            {
+                writer.WriteRawValue(value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                writer.WriteNumberValue(value);
+            }
+        }
+    }
 
     public static string Serialize<T>(T item) => JsonSerializer.Serialize(item, Options);
 
