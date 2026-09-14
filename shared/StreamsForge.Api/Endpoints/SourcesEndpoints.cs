@@ -272,6 +272,34 @@ public static class SourcesEndpoints
             };
         }).RequireAuthorization("Viewer");
 
+        // GET /{name}/replay — plan 026 wave 3 D6: what this source's replay log currently retains
+        // (memory + disk). Sources have no id, so the route segment IS the scope, same as every other
+        // route in this file. NotSupportedException (Dapr, until PARITY D11 closes) becomes 501 with the
+        // facade's own message rather than a bare 500 — this route is expected to be flavor-dependent.
+        group.MapGet("/{name}/replay", async (string name, ClaimsPrincipal principal, AccessGuard guard, ICatalogFacade registry, IReplayStatusFacade replay) =>
+        {
+            var src = await registry.GetSourceAsync(name);
+            if (await RefuseAsync(guard, principal, Actions.SourceRead, src?.Name ?? name, src?.Tags) is { } refusal)
+            {
+                return refusal;
+            }
+
+            if (src is null)
+            {
+                return Results.NotFound();
+            }
+
+            try
+            {
+                var status = await replay.GetSourceAsync(name);
+                return status is null ? Results.NotFound() : Results.Ok(status);
+            }
+            catch (NotSupportedException ex)
+            {
+                return Results.Json(new ErrorResponse(ex.Message), statusCode: StatusCodes.Status501NotImplemented);
+            }
+        }).RequireAuthorization("Viewer");
+
         // ---- Client-push ingress (plan 008 W4). POST holds NO policy of its own — every branch below
         // is a 1:1 mapping of IngestOutcome onto an HTTP status per IngestModels.cs's own doc comments;
         // all the actual admission/coercion decisions live in IIngressFacade/AppCore.Ingest. ----

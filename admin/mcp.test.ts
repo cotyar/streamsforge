@@ -73,6 +73,9 @@ const stub = Bun.serve({
         return json({ id: "t1", status: "Running" });
       case "GET /api/tables/missing":
         return json({ error: "table 'missing' not found" }, 404);
+      // Plan 026 wave 3 D6: replay-log status.
+      case "GET /api/tables/t1/replay":
+        return json({ firstSeq: 1, lastSeq: 500, totalSeen: 500, retainedBytes: 0, persisted: false, segments: 0 });
 
       // --- plan 016 wave 5: instance identity + peers ---
       // Both answer unconditionally, regardless of the Authorization header — /api/meta/instance is
@@ -554,6 +557,18 @@ describe("SfClient", () => {
   test("sources have no lifecycle, and say so before making a request", async () => {
     const client = new SfClient({ url: STUB_URL, token: "t" });
     expect(client.lifecycle("sources", "trades", "start")).rejects.toThrow(SfError);
+  });
+
+  // Plan 026 wave 3 D6: GET /api/{kind}/{id}/replay — uniform across all three kinds (unlike
+  // metrics(), which special-cases sources onto /status).
+  test("replay reads GET /api/{kind}/{id}/replay and returns the status verbatim", async () => {
+    const client = new SfClient({ url: STUB_URL, token: "t" });
+    const status = (await client.replay("tables", "t1")) as Record<string, unknown>;
+
+    expect(recorded.at(-1)!.path).toBe("/api/tables/t1/replay");
+    expect(status).toEqual({
+      firstSeq: 1, lastSeq: 500, totalSeen: 500, retainedBytes: 0, persisted: false, segments: 0,
+    });
   });
 
   test("an unreachable instance is one clear error, not a raw fetch failure", async () => {

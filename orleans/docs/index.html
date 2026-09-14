@@ -245,6 +245,11 @@ mark { background: var(--kbd-bg); color: inherit; border-radius: 3px; padding: 0
   <a href="#grpc-codegen" class="sub">Typed client codegen</a>
   <a href="#clients">Client libraries</a>
   <a href="#realtime">Realtime events</a>
+  <a href="#replay">Stream replay</a>
+  <a href="#replay-status" class="sub">Checking retention</a>
+  <a href="#replay-definition" class="sub">replayFrom</a>
+  <a href="#replay-restart" class="sub">Restart resume</a>
+  <a href="#replay-limits" class="sub">What it doesn't reach yet</a>
   <div class="navgap"></div>
   <a href="#formats">Payload formats</a>
   <a href="#formats-csv" class="sub">CSV &amp; friends</a>
@@ -887,6 +892,44 @@ t.rowsFlow                             // StateFlow&lt;List&lt;Row&gt;&gt;</code
 <tr><td><code>subscribeSource(name)</code></td><td><code>sourceEvent</code></td><td>raw source events (sampled) for the live tape</td></tr>
 <tr><td><code>SubscribeTable(name)</code></td><td><code>tableDelta</code></td><td><code>(tableName, deltas[{row, weight}], seq)</code> — Z-set deltas</td></tr>
 </tbody></table></div>
+</section>
+
+<section id="replay">
+<h2>Stream replay</h2>
+<p>Every publish site in the platform — connector, generator and ingest sources, pipeline result batches, and (classic-mode) table delta batches — keeps a producer-owned, sequence-numbered log behind the same attach gate late-consumer replay (plan 023) always used. Every row/batch is assigned a <code>position</code> exactly once, by its producer: unlike the per-subscription <code>seq</code> counter every SDK already knew (which restarts at 1 for each new subscription), two concurrent subscribers see the identical <code>position</code> for the identical row.</p>
+
+<h3 id="replay-retention">In-memory vs persisted</h3>
+<p>By default a stream's log is an in-memory ring — 10,000 entries, unbounded by age — that resets to position 1 every time its owning grain reactivates (a silo restart, an idle deactivation, a redeploy). Opting a definition into <code>replay: { persist: true, retainMs, maxBytes }</code> (on any <code>SourceDefinition</code>, <code>PipelineDefinition</code> or <code>TableDefinition</code>) adds a disk-backed tier under <code>DataDir/replay/&lt;namespace&gt;/&lt;qualified key&gt;/NNNNNN.ndjson</code>, rotated at the host's <code>Replay:SegmentBytes</code> (default 8&nbsp;MB) and retained by <code>retainMs</code>/<code>maxBytes</code> (0 on either falls back to the host's <code>Replay:RetainMs</code>/<code>Replay:MaxBytesPerStream</code> — default unlimited-by-age / 256&nbsp;MB). Persisting is what makes a <b>position durable</b>: a client that remembers a position across a restart can still ask for it, because the log survives the restart too. <code>persist</code> is independent of <code>TablePersistenceMode</code> — a <code>MemoryOnly</code> table with <code>replay.persist</code> keeps a delta log on disk and nothing else about its rows.</p>
+
+<h3 id="replay-status">Checking what is retained: <code>/replay</code></h3>
+<div class="tablewrap"><table>
+<thead><tr><th>Route</th><th>Method</th><th>What</th></tr></thead>
+<tbody>
+<tr><td><code>/api/sources/{name}/replay</code></td><td class="pill get">GET</td><td>A source's replay-log status.</td></tr>
+<tr><td><code>/api/pipelines/{id}/replay</code></td><td class="pill get">GET</td><td>A pipeline's result-log status.</td></tr>
+<tr><td><code>/api/tables/{id}/replay</code></td><td class="pill get">GET</td><td>A table's delta-log status.</td></tr>
+</tbody></table></div>
+<p>The pipeline and table routes resolve <code>{id}</code> id-or-name like every other <code>GET</code> route in this API (<a href="#api-naming">id-or-name resolution</a>); all three carry the same read entitlement (<code>source.read</code>/<code>pipeline.read</code>/<code>table.read</code>) as the entity's own <code>GET</code>. Each answers <code>{ firstSeq, lastSeq, totalSeen, retainedBytes, persisted, segments }</code>: <code>firstSeq</code>/<code>lastSeq</code> bound what a replay request can still reach, <code>totalSeen</code> is the all-time count (so "you got the last N of M" stays an honest, loggable statement even after eviction), and <code>persisted</code>/<code>segments</code> report the disk tier. 404 when the entity does not exist. On the <b>Dapr flavor every one of these three routes answers 501</b> instead — Dapr's producers have no position-addressed replay log yet (dapr/PARITY.md D11).</p>
+
+<h3 id="replay-attach">Subscribing from a position: gRPC and the hub</h3>
+<p>Every streaming RPC (<code>SubscribeSource</code>/<code>SubscribePipeline</code>/<code>SubscribeTable</code>) takes optional <code>from_seq</code>/<code>from_timestamp_ms</code> on its request — <code>from_seq</code> wins when both are set — and every message it delivers carries <code>position</code> plus, on the first message only, <code>replay_truncated</code> when the request asked for a position older than what remains (retained events/batches are delivered first, then live ones, positions consecutive throughout). SignalR mirrors the same capability as three extra hub methods, <code>SubscribeSourceFrom</code> / <code>SubscribePipelineFrom</code> / <code>SubscribeTableFrom(id, fromSeq?, fromTimestampMs?)</code>, alongside the plain <code>Subscribe*</code> methods (unchanged — they still mean "everything currently retained", plan 023's original behaviour). A gRPC or SignalR subscriber owns no executor, so it may ask for any retained position at any time; this is the one form of replay with no restart involved.</p>
+
+<h3 id="replay-definition">Replaying a table or pipeline from a position: <code>replayFrom</code></h3>
+<p>A <b>consumer</b> — a table or a pipeline — asks for its own inputs to start from a position with <code>replayFrom: { "&lt;input name&gt;": { "seq": N } | { "timestampMs": T } }</code> on the definition. This is applied <b>only at <code>StartAsync</code></b>, into a fresh executor — never rule D5, stated plainly: the Engine drops any row older than its watermark minus <code>AllowedLatenessMs</code> (1&nbsp;s), so replaying rows into a LIVE executor would make every one of them a late event by construction, not a design choice this plan could work around. Consequently, <b>editing <code>replayFrom</code> on a Running table or pipeline restarts it</b>, exactly like an SQL edit would — status cycles Stopped→Starting→Running, and (as of this wave) the edit bumps <code>Revision</code> too, the same as any other definition change. An input not named in <code>replayFrom</code> attaches exactly as it always has (plan 023's default late-attach for connector sources; live-only for generators and ingest). A <code>replayFrom</code> entry is refused at create/update, with a named reason, when it names: a <b>table</b> input (its rows arrive through the backfill snapshot, plan 023's protocol, which has no position to seek in), an <b>unknown</b> input, or a <code>crdt</code> source (which keeps its own replay — plan 020's <code>ReplayAsync</code> — and is not logged here).</p>
+
+<h3 id="replay-restart">Restart resume (D8)</h3>
+<p>A table whose stream inputs (sources or pipelines) have <code>replay.persist</code> on gains a real answer to the platform's long-standing RESTART-RESUME LIMITATION: instead of rebuilding purely from live traffic after a host restart, it replays each persisted input from the start of its own retention into a fresh executor, and <code>rebuilding</code> (<code>GET /api/tables/{id}/metrics</code>) stays <code>true</code> until the replay has caught every persisted input up to the position it held at shutdown. A table with no persisted inputs restarts exactly as it did before this plan — an empty table that fills back in from live traffic only.</p>
+
+<h3 id="replay-limits">What replay does not reach yet</h3>
+<ul>
+<li><b>Coordinator-mode tables</b> (<a href="#tables-parallel"><code>Parallelism &ge; 2</code></a>) publish deltas from <code>TableOutputGrain</code>, not through the table's own gate — a position on such a table's delta stream replays nothing and says so honestly (<code>replay_truncated: true</code>, an empty batch) rather than silently. Only classic-mode (<code>Parallelism == 1</code>) tables have a real delta log today.</li>
+<li><b><a href="#tables-shards">Sharded tables</a></b> publish deltas per shard through the router, so a sharded table's log is fed by the router's MERGED stream — its position is the router's, never one shard's own.</li>
+<li><b><code>crdt</code> sources</b> keep their own replay and are not logged here (see <code>replayFrom</code> above); naming one is refused with that reason.</li>
+<li><b>In-memory positions restart from 1 on activation</b> unless <code>replay.persist</code> is on — a client holding a position across a restart otherwise gets <code>replay_truncated</code> rather than the rows it expected, which is exactly the signal it should act on.</li>
+</ul>
+
+<h3 id="replay-dapr">Dapr</h3>
+<p>The Dapr flavor stores <code>replayFrom</code> and <code>replay</code> on every definition — they round-trip through <a href="#config-format">config export/import</a> identically on both flavors — but has no replay log to act on them with: a table or pipeline REFUSES to start with <code>replayFrom</code> set (the same refusal <code>shardBy</code> already gets there), and every <code>/replay</code> route above answers 501. <code>dapr/PARITY.md</code> D11 tracks the port.</p>
 </section>
 
 <section id="formats">

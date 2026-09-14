@@ -118,6 +118,46 @@ source stream ─▶ TableIngestGrain ──epoch-stamped batches──▶ Table
 - Measured (soak, 2 000 ev/s × 60 s): P=4 p99 latency **0.70×** the single-grain baseline
   (higher median from epoch batching, radically tighter tail — the point of the design).
 
+## Stream replay (plan 026)
+
+A producer-owned, sequence-numbered log sits behind the same attach gate plan 023's late-consumer
+replay always used — `ReplayLog<T>` (`shared/StreamsForge.AppCore/Streaming/ReplayLog.cs`), an
+in-memory ring (10,000 entries, unbounded by age unless the host's `Replay:RetainMs` says otherwise)
+that assigns a monotonic `Seq`/`position` to every published row or batch, plus `Snapshot(ReplayFrom?)`
+for "everything at/after this seq or timestamp" and `FirstSeq`/`LastSeq`/`TotalSeen` so eviction never
+turns into a silent gap. `ReplayGate<T>` (Host, generalizing plan 023's private `SourceReplayGate`) is
+the turn-based owner every producer grain shares: `ConnectorGrain`, `GeneratorGrain`,
+`IngestSourceGrain` (D3 — ingest publishing had no grain of its own before this plan), `PipelineGrain`
+(result batches) and `TableGrain` (delta batches, classic mode only — coordinator mode publishes from
+`TableOutputGrain` and is not wired in yet). `BeginAttachAsync(ReplayFrom?)`/`EndAttachAsync()` is the
+whole consumer protocol, unchanged in shape from plan 023: Begin → subscribe → feed the snapshot
+through the handler → End in a `finally`.
+
+**Persisted tier (D6, opt-in per definition via `replay: { persist, retainMs, maxBytes }`)**:
+`ReplaySegmentLog` (`shared/StreamsForge.AppCore/Streaming/ReplaySegmentLog.cs`) backs the ring with
+append-only NDJSON segments — `{seq, ts, appendedAtMs, payload}` per line — under
+`DataDir/replay/<namespace>/<qualified key>/NNNNNN.ndjson`, rotated at `Replay:SegmentBytes` (default
+8 MB) and pruned by age/bytes (whole segments only; a torn last line from a mid-write crash is dropped
+on read, never fails the open). Write-behind on the owning grain's existing flush cadence — no new
+persistence provider, deliberately (a `JournaledGrain` needs one this project does not register, and
+`TableHistoryGrain`'s class doc already argued against reusing `TableJournalState`, which is per-key
+coalesced, not a sequence). Persisting is what survives a grain reactivation: without it every ring
+resets to `Seq 1` on the next activation, silo restart included.
+
+`IReplayStatusFacade` (`shared/StreamsForge.Contracts/ReplayFrom.cs`) is the read side behind
+`GET /api/{sources|pipelines|tables}/{key}/replay` — `GetSourceAsync`/`GetPipelineAsync`/
+`GetTableAsync`, `null` for an unknown entity, `NotSupportedException` for a flavor with no log at all
+(Dapr, until `dapr/PARITY.md` D11 closes). `ReplayFrom`/`ReplayConfig`/`ReplayStatus` are three small
+records in `StreamsForge.Contracts`, additive on `SourceDefinition`/`PipelineDefinition`/
+`TableDefinition` — a consumer definition's own `ReplayFrom` dictionary (`{"<input>": {seq|timestampMs}}`)
+is applied once, at `StartAsync`, into the fresh executor a start always builds; never into a live one
+(the Engine's `AllowedLatenessMs` watermark rule would turn every replayed row into a late event
+otherwise), which is why editing it on a Running table/pipeline restarts it exactly like an SQL edit.
+Full design (D1–D9), the wire shape (`from_seq`/`from_timestamp_ms`/`position`/`replay_truncated` on
+`streamsforge.proto` and the `SubscribeSourceFrom`/`SubscribePipelineFrom`/`SubscribeTableFrom` hub
+methods) and the operator-facing walkthrough: `orleans/docs/index.html` § Stream replay;
+`plans/026-stream-replay.md` for the full decision table and per-wave outcomes.
+
 ## Environment isolation (plan 021)
 
 An environment is not a field anywhere — it is **which key a singleton grain is activated at**.

@@ -144,6 +144,9 @@ public class AuthorizationCoverageTests
         new("GET", "/api/sources/{name}", Guards.Viewer),
         new("GET", "/api/sources/{name}/proto", Guards.Viewer),
         new("GET", "/api/sources/{name}/status", Guards.Viewer),
+        // Plan 026 wave 3 D6: replay-log status. Viewer, the same as every other read here — AccessGuard
+        // still asks source.read at the resolved scope inside the handler.
+        new("GET", "/api/sources/{name}/replay", Guards.Viewer),
         new("GET", "/api/sources/{name}/ingest", Guards.Viewer),
         new("POST", "/api/sources/", Guards.Editor),
         new("PUT", "/api/sources/{name}", Guards.Editor),
@@ -187,6 +190,8 @@ public class AuthorizationCoverageTests
         new("GET", "/api/pipelines/{id}/results", Guards.Viewer),
         new("GET", "/api/pipelines/{id}/results.csv", Guards.Viewer),
         new("GET", "/api/pipelines/{id}/metrics", Guards.Viewer),
+        // Plan 026 wave 3 D6: replay-log status.
+        new("GET", "/api/pipelines/{id}/replay", Guards.Viewer),
         new("POST", "/api/pipelines/", Guards.Editor),
         new("PUT", "/api/pipelines/{id}", Guards.Editor),
         new("DELETE", "/api/pipelines/{id}", Guards.Editor),
@@ -201,6 +206,8 @@ public class AuthorizationCoverageTests
         new("GET", "/api/tables/{id}/rows", Guards.Viewer),
         new("GET", "/api/tables/{id}/rows.csv", Guards.Viewer),
         new("GET", "/api/tables/{id}/metrics", Guards.Viewer),
+        // Plan 026 wave 3 D6: replay-log status.
+        new("GET", "/api/tables/{id}/replay", Guards.Viewer),
         new("GET", "/api/tables/{id}/proto", Guards.Viewer),
         new("GET", "/api/tables/{id}/search", Guards.Viewer),
         new("POST", "/api/tables/{id}/history/lookup", Guards.Viewer),

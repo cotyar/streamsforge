@@ -488,6 +488,36 @@ public static class PipelinesEndpoints
 
             return Results.Ok(await pipelines.GetMetricsAsync(def?.Id ?? id));
         }).RequireAuthorization("Viewer");
+
+        // GET /{id}/replay — plan 026 wave 3 D6: what this pipeline's result-batch replay log currently
+        // retains (memory + disk). id-or-name via EntityLookup, same as every other GET route in this
+        // file — the facade itself is keyed by pipeline id (IReplayStatusFacade.GetPipelineAsync's own
+        // doc), which EntityLookup already resolved to. NotSupportedException (Dapr, until PARITY D11
+        // closes) becomes 501 rather than a bare 500.
+        group.MapGet("/{id}/replay", async (string id, ClaimsPrincipal principal, AccessGuard guard, ICatalogFacade registry, IReplayStatusFacade replay) =>
+        {
+            var hit = await EntityLookup.PipelineAsync(registry, id);
+            if (await RefuseAsync(guard, principal, Actions.PipelineRead, hit.Value?.Name ?? id, hit.Value?.Tags) is { } refusal)
+            {
+                return refusal;
+            }
+
+            if (EntityLookup.Reject(hit) is { } miss)
+            {
+                return miss;
+            }
+
+            var def = hit.Value!;
+            try
+            {
+                var status = await replay.GetPipelineAsync(def.Id);
+                return status is null ? Results.NotFound() : Results.Ok(status);
+            }
+            catch (NotSupportedException ex)
+            {
+                return Results.Json(new ErrorResponse(ex.Message), statusCode: StatusCodes.Status501NotImplemented);
+            }
+        }).RequireAuthorization("Viewer");
     }
 
     /// <summary>Null when the caller may proceed; the ready-made 403 when they may not — the same helper

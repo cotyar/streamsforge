@@ -316,7 +316,22 @@ pipeline where each source/pipeline input starts when it (re)starts. On Dapr: th
 overloads accept and ignore `from` exactly like the source one; a definition with a non-empty
 `replayFrom` STORES fine (config promotion round-trips) but `TableActor.StartAsync` refuses to run it
 with a named reason, the same rule `shardBy` already follows, and `PipelineActor.StartAsync` refuses
-identically. Wave 3 (persisted log) will add its line here.
+identically.
+
+**Wave 3 (2026-09-14) added the persisted disk tier (D6) and the `/replay` status route, Orleans only,
+same debt shape again.** `replay: { persist, retainMs, maxBytes }` and `replayFrom` now both round-trip
+through `ConfigPipeline`/`ConfigTable` (so a `replayFrom`-only edit correctly bumps `Revision` on both
+flavors — the projection lives in `shared/StreamsForge.AppCore/Config/`, runtime-agnostic), and
+`GET /api/{sources|pipelines|tables}/{key}/replay` is wired on **both** hosts through one new seam,
+`IReplayStatusFacade` (`shared/StreamsForge.Contracts/ReplayFrom.cs`): Orleans answers from each
+producer's own gate (`OrleansReplayStatusFacade`), Dapr answers `501` via `StubReplayStatusFacade` —
+a `NotSupportedException` naming this section, not an invented status. `ReplaySegmentLog` (the NDJSON
+segment writer/reader/retention) and `ReplayOptions` (`Replay:SegmentBytes`/`RetainMs`/
+`MaxBytesPerStream`) live in `shared/StreamsForge.AppCore/Streaming/`, runtime-agnostic by
+construction, so closing this D11 line — like wave 1/2's — is wiring the three Dapr actors to the
+already-shared log and options, not new design. Until then: a Dapr `replay.persist: true` STORES
+(config promotion still round-trips it byte-for-byte) but nothing on that flavor ever writes a segment
+or reads one back, and every `/replay` route answers 501 rather than a fabricated `persisted: false`.
 
 ---
 

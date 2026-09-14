@@ -284,6 +284,7 @@ internal static class ConfigJsonMapper
             p.Metadata ??= [];
             p.Sinks ??= [];
             p.DependsOn ??= []; // Plan 016 wave 3-B — same "explicit null -> empty default" rule as Sinks.
+            p.ReplayFrom ??= []; // Plan 026 wave 3 — same rule, one level deeper (a Dictionary, not a List).
         }
 
         foreach (var t in doc.Tables)
@@ -292,6 +293,7 @@ internal static class ConfigJsonMapper
             t.Metadata ??= [];
             t.Sinks ??= [];
             t.DependsOn ??= []; // Plan 016 wave 3-B — same "explicit null -> empty default" rule as Sinks.
+            t.ReplayFrom ??= []; // Plan 026 wave 3 — same rule, one level deeper (a Dictionary, not a List).
         }
     }
 
