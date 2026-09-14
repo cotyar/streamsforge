@@ -503,7 +503,10 @@ internal sealed class OrleansReplayStatusFacade(IClusterClient client) : IReplay
     public async Task<ReplayStatus?> GetTableAsync(string tableName)
     {
         var env = EnvironmentAmbient.Current;
-        var def = await client.RegistryFor(env).GetTableAsync(tableName);
+        // ICatalogFacade.GetTableAsync resolves by ID; the delta log (and the /replay route's own
+        // resolution, plan 016) is keyed by NAME — so look the name up in the catalog list.
+        var tables = await client.RegistryFor(env).GetTablesAsync();
+        var def = tables.FirstOrDefault(t => t.Name == tableName) ?? tables.FirstOrDefault(t => t.Id == tableName);
         if (def is null) return null;
         return await client.GetGrain<ITableGrain>(EnvKeys.Qualify(env, def.Name)).GetReplayStatusAsync();
     }
