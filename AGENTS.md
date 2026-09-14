@@ -407,6 +407,10 @@ count is the precondition for proving truncation, not the assertion) and the pre
 `ConnectorGrainClusterTests.Missing_file_reports_error_status_with_growing_backoff` (waits for a
 missing-file source's second failed poll so `ConsecutiveFailures` grows past 1 — a poll cadence race
 under load, not logic).
+Dapr side, same family: `StreamingDaprStreamBridgeTests.OnLifecycleEventAsync_SourceDeleted_ForgetsThisBridgesOwnPacingState`
+asserts a forgotten source relays "immediately" (a sub-100 ms bound) — it lost twice on 2026-09-14, both
+times while an Orleans whole-solution run was hogging the CPU beside it (219 ms, 150 ms), and passed 13/13
+alone each time.
 Re-run a failure in isolation before calling it a regression — and report BOTH results, never just the
 green one. Nothing else on this list is allowed to grow without a paragraph saying why the test is
 time-bounded; a genuinely broken test hiding among "known flakes" is the failure mode this list can cause.
