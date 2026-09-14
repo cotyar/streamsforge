@@ -1,6 +1,6 @@
 # 026 — Stream replay: subscribe from a position in the past, on any persistence mode
 
-Status: **wave 1 DONE on Orleans** (2026-09-14); waves 2–4 planned. Dapr gets a PARITY line per wave and its own port later (`dapr/PARITY.md` § 2b D11).
+Status: **waves 1–2 DONE on Orleans** (2026-09-14); waves 3–4 planned. Dapr gets a PARITY line per wave and its own port later (`dapr/PARITY.md` § 2b D11).
 
 ## Why
 
@@ -175,6 +175,52 @@ Acceptance:
 - **Live positions are counted, not stamped** (`LastSeq + n` from the attach snapshot): exact except
   inside plan 023's ~one-pull-period window where a queued row is delivered live AND replayed, so the
   tests quiesce 2 s before attaching. Stamping positions on the wire is the upgrade path.
+
+### Wave 2 (2026-09-14; orchestrator pre-wave `3e6c031` + `2ad811d`, agent A `71084ae`, agent B `b9801bb`, merges `0e9be6f`/`c0fa6a6`)
+
+- **Pre-wave (orchestrator).** `ReplayGate<T>` (Host) generalizes wave 1's gate to any payload;
+  `SourceReplayGate` is now a thin `EventRecord` face over it. `PipelineGrain` (result batches, event
+  time = first envelope's `TimestampMs`) and classic-mode `TableGrain` (delta batches, event time =
+  wall clock at publish) publish through it and implement the new `IReplayableBatchGrain<T>`
+  (`StreamReplaySnapshot<T>`: position = published BATCH, not row). `TableAttachSnapshot.LastSeq`
+  (D7) is read in the same turn as rows and epoch. `TableDefinition.ReplayFrom [Id(37)]` and
+  `PipelineDefinition.ReplayFrom [Id(19)]` (`Dictionary<string, ReplayFrom>` keyed by input name,
+  client-owned, so it round-trips through update and config import untouched). Proto:
+  `SubscribePipelineRequest`/`SubscribeTableRequest.from_*`, `ResultEnvelope`/`TableDeltaBatch.position`
+  + `replay_truncated`. Dapr: the two facade overloads accept and ignore `from`; `TableActor` and
+  `PipelineActor` REFUSE to start with `replayFrom` set, the `shardBy` rule (the definition stores,
+  so promotion back to Orleans loses nothing). Found: Dapr's `CatalogUpdateRoundTripTests` guards every
+  client-owned field by reflection and had to be taught `Dictionary<string, ReplayFrom>`.
+- **Agent A** — `OrleansEntityStreamFacade` batch overloads (pipeline grain by qualified id, table grain
+  by qualified name; no catalog lookup); gRPC `SubscribePipeline`/`SubscribeTable` through one shared
+  buffer-then-flush helper (rows of one batch share its `position`); hub `SubscribePipelineFrom` /
+  `SubscribeTableFrom`. `BatchReplayGrpcTests` (6): table deltas replay-then-live, D7 (`LastSeq` equals
+  the last position a concurrent subscriber saw), gRPC position + truncation past 10 000 batches
+  (`Position == 6`), pipeline rows share a batch position, hub replay-then-join, coordinator-mode
+  table → empty replay flagged `Truncated`, live still flows.
+- **Agent B** — `ReplayInputs` (position lookup + kind-dispatched driver, one truncation warning
+  shape); `TableGrain`, `PipelineGrain` and `TableIngestGrain` attach a NAMED input through the gate
+  with `from` (connector, generator AND ingest; a pipeline input through `IPipelineGrain`'s gate), an
+  unnamed input keeps its pre-026 path byte-for-byte; snapshot fed before the watermark timer is armed
+  (D5 — `LateEvents == 0` asserted for a windowed pipeline replaying 500 rows); `RegistryGrain`
+  validates every `replayFrom` key on create AND update (table input, unknown input, crdt refused
+  with the reason) and `replayFromChanged` restarts a Running table/pipeline. `ReplayFromClusterTests`
+  (9): seq 1 → all 500 (never less than plan 023's default), seq 401 → 100, generator from a position,
+  table over pipeline from batch 101 → ids 101..300 exactly, windowed pipeline no late events,
+  restart-on-change for both kinds, refusals, Parallelism = 2 variant.
+- **Found and not fixed:** (1) a `replayFrom` edit does NOT bump `Revision` — `CatalogRevisions`
+  compares the config projection and `ConfigTable`/`ConfigPipeline` do not carry the field (same
+  ceiling `Persistence`/`FlushMs` already sit on); the restart still happens; **wave 3 adds `replayFrom`
+  to the config projection** with the `replay` group. (2) `ArrangementGrain` is out of scope: driven by
+  the frozen `ArrangementAttachRequest`, shared by several tables that may name different positions.
+  (3) `POST /api/{kind}/validate` takes SQL only, so `replayFrom` validation lives on the single write
+  path (create/update), which REST and config import both go through. (4) Coordinator-mode tables
+  (Parallelism ≥ 2) publish deltas from `TableOutputGrain`, not through the table's gate — a position
+  on such a table's delta stream replays nothing and says so (`Truncated`); wave 3 owes routing it.
+- **Two new load-sensitive facts** (`ReplayFromClusterTests.Table_with_replayFrom_over_a_generator_*`
+  and `Changing_replayFrom_on_a_running_table_restarts_it`): both count rows after a 2 s quiesce sized
+  for an idle machine; under a 12-minute whole-solution run the pull agent lagged far enough that rows
+  arrived live AND replayed (plan 023's gap). Pass alone; listed in AGENTS.md's flake paragraph.
 
 ## Gates (every wave)
 

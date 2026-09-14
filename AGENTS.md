@@ -231,10 +231,20 @@ Orleans' memory adapter IS rewindable (verified by IL) but only within a 4096-ev
 hash-ring queue shared silo-wide, which is why replay lives above the transport; `init` setters on a
 `[GenerateSerializer]` record fail codegen (`ORLEANS0101`); live positions are COUNTED from the
 attach snapshot's `LastSeq`, so a subscription landing inside plan 023's one-pull-period gap can run
-one ahead (tests quiesce 2 s first); tables/pipelines still attach to generator/ingest sources
-without the gate until wave 2's `replayFrom`; positions restart at 1 per activation until wave 3's
-persisted log; Dapr accepts and ignores `from` (`dapr/PARITY.md` § 2b D11). Plan, decisions D1–D9
-and per-wave outcomes: `plans/026-stream-replay.md`.
+one ahead (tests quiesce 2 s first); positions restart at 1 per activation until wave 3's
+persisted log; Dapr accepts and ignores `from` (`dapr/PARITY.md` § 2b D11). **Wave 2** extended the
+same gate (`ReplayGate<T>`) to pipeline result batches and classic-mode table delta batches (a
+position is a published BATCH; coordinator-mode tables publish from `TableOutputGrain` and replay
+nothing yet), gave gRPC `SubscribePipeline`/`SubscribeTable` and the hub's `SubscribePipelineFrom`/
+`SubscribeTableFrom` the same `from` + `position`, and added **`replayFrom`** (`{ "<input>": { seq |
+timestampMs } }`) to table and pipeline definitions: applied at START only into a fresh executor
+(replaying into a live one makes every row a late event), so changing it on a Running entity
+restarts it; a named source input (connector, generator or ingest) or pipeline input attaches from
+that position, an unnamed one keeps the pre-026 path; a table input, an unknown input or a crdt
+source is refused at create/update. A `replayFrom` edit does not bump `Revision` (the config
+projection does not carry it yet — wave 3). Dapr stores `replayFrom` but `TableActor`/`PipelineActor`
+refuse to start with it set, like `shardBy`. Plan, decisions D1–D9 and per-wave outcomes:
+`plans/026-stream-replay.md`.
 
 **Environment isolation** (plan 021): an environment is the **registry KEY**, not a column — Orleans
 activates a whole separate `RegistryGrain` per environment (Dapr: `RegistryActor`), so two same-named
@@ -386,6 +396,11 @@ the deadline is now 90 s and the test asserts positions, not timing) and
 `TableOverPipelineClusterTests.A_partitioned_table_reads_a_pipeline_through_its_ingest_grains` (polls a
 partitioned table's row count to 150 within a deadline; 82 under load, 150/150 alone — the ingest-grain
 hop is one more async stage the count has to cross).
+Plan 026 wave 2 added `ReplayFromClusterTests.Table_with_replayFrom_over_a_generator_gets_rows_from_that_position`
+and `ReplayFromClusterTests.Changing_replayFrom_on_a_running_table_restarts_it`: both count rows after a
+2 s quiesce sized for an idle machine, and under a 12-minute whole-solution run the memory-stream pull
+agent lagged enough that rows arrived live AND through the replay (plan 023's "ONE GAP"), so the count
+overshoots (53 vs 50, 400 vs 100). Pass alone.
 Re-run a failure in isolation before calling it a regression — and report BOTH results, never just the
 green one. Nothing else on this list is allowed to grow without a paragraph saying why the test is
 time-bounded; a genuinely broken test hiding among "known flakes" is the failure mode this list can cause.
