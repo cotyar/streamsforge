@@ -139,9 +139,47 @@ public sealed class ConnectorGrain(
     /// into <see cref="SourceReplayGate"/> so generators and ingest sources own the identical mechanism).
     /// Created on first use because the safety timer needs <c>this</c>.</summary>
     private SourceReplayGate? _gate;
-    private SourceReplayGate Gate => _gate ??= new SourceReplayGate(
-        SourceStream,
-        release => this.RegisterGrainTimer(release, SourceReplayGate.SafetyRelease, Timeout.InfiniteTimeSpan));
+    private SourceReplayGate Gate => _gate ??= CreateGate();
+    private ReplayConfig? _gateReplay;
+    private IGrainTimer? _replayFlushTimer;
+
+    /// <summary>Plan 026 D6 — the gate is built against <c>state.State.Def?.Replay</c>, so BOTH doors into
+    /// this activation (the boot resume in <see cref="OnActivateAsync"/> and <see cref="StartAsync"/>) hand
+    /// it the definition currently on file, and persistence is therefore on before the first publish, which
+    /// is what makes positions continue from the segments rather than restart at 1. Toggling
+    /// <c>replay.persist</c> drops the gate in StartAsync so this rebuilds it — positions then continue from
+    /// the disk's own <c>LastSeq</c>, or restart at 1 when the tier is turned off.</summary>
+    private SourceReplayGate CreateGate()
+    {
+        var gate = new SourceReplayGate(
+            SourceStream,
+            release => this.RegisterGrainTimer(release, SourceReplayGate.SafetyRelease, Timeout.InfiniteTimeSpan));
+        _gateReplay = state.State.Def?.Replay;
+        var disk = ReplayPersistence.Open(ServiceProvider, _gateReplay, StreamConstants.SourcesNamespace, this.GetPrimaryKeyString());
+        _replayFlushTimer?.Dispose();
+        _replayFlushTimer = null;
+        if (disk is not null)
+        {
+            gate.EnablePersistence(disk, ReplayPersistence.SerializeRow, ReplayPersistence.DeserializeRow);
+            _replayFlushTimer = this.RegisterGrainTimer(ReplayFlushAsync, ReplayPersistence.FlushPeriod, ReplayPersistence.FlushPeriod);
+        }
+        return gate;
+    }
+
+    private Task ReplayFlushAsync() => _gate?.FlushAsync() ?? Task.CompletedTask;
+
+    /// <summary>Rebuilds the gate when the definition's replay group changed, so the disk tier goes on/off
+    /// with the flag instead of at the next activation. Called only from StartAsync, after the force-release
+    /// that has already handed out anything a consumer was owed.</summary>
+    private async Task RebuildGateIfReplayChangedAsync()
+    {
+        if (_gate is null || _gateReplay == state.State.Def?.Replay)
+        {
+            return;
+        }
+        await _gate.FlushAsync();
+        _gate = null;
+    }
 
     // Emission-counter persist throttle for the gRPC/NATS path (EmitRowsAsync can fire once per remote
     // frame/message — far more often than a poll cycle's natural "persist once per cycle" cadence):
@@ -156,7 +194,21 @@ public sealed class ConnectorGrain(
             EnsureTrackers();
             ArmForKind(state.State.Def, persistNextRun: false);
         }
+        // Plan 026 D6: build the gate NOW (not on the first publish) when the definition on file opted in
+        // — attaching the disk tier has to precede the first append, and a resumed source polls on a timer
+        // this method just armed.
+        if (state.State.Def?.Replay is { Persist: true })
+        {
+            _ = Gate;
+        }
         return base.OnActivateAsync(cancellationToken);
+    }
+
+    /// <summary>Plan 026 D6 — the last write-behind flush; a crash loses only what this would have written.</summary>
+    public override async Task OnDeactivateAsync(DeactivationReason reason, CancellationToken cancellationToken)
+    {
+        try { await ReplayFlushAsync(); } catch { /* best-effort */ }
+        await base.OnDeactivateAsync(reason, cancellationToken);
     }
 
     public async Task StartAsync(SourceDefinition def)
@@ -167,6 +219,7 @@ public sealed class ConnectorGrain(
         await Gate.ForceReleaseAsync();
 
         state.State.Def = def;
+        await RebuildGateIfReplayChangedAsync();
         state.State.Running = true;
         // A (re)start is the operator saying "try this definition now". Carrying the old failure streak
         // across it meant a source that had backed off to minutes kept waiting out that backoff even
@@ -197,6 +250,8 @@ public sealed class ConnectorGrain(
         // Same reasoning as StartAsync's identical call: a stop must not eat rows this source had already
         // produced and merely deferred on a consumer's behalf.
         await Gate.ForceReleaseAsync();
+        // Plan 026 D6: the write-behind tail is owed to disk before this activation stops producing.
+        await ReplayFlushAsync();
 
         state.State.Running = false;
         _generation++;

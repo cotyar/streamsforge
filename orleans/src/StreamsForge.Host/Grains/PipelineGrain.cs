@@ -5,6 +5,7 @@ using Orleans.Streams;
 using StreamsForge.Abstractions;
 using StreamsForge.AppCore.Connectors;
 using StreamsForge.AppCore.Environments;
+using StreamsForge.AppCore.Streaming;
 using StreamsForge.Engine;
 using StreamsForge.Host.Facades;
 using StreamsForge.Host.Streaming;
@@ -41,11 +42,44 @@ public sealed class PipelineGrain(ILogger<PipelineGrain> logger) : Grain, IPipel
     /// (or a table with <c>replayFrom</c> naming this pipeline) can attach from a batch position. A batch's
     /// event time is its first envelope's <c>TimestampMs</c>.</summary>
     private ReplayGate<List<ResultEnvelope>>? _gate;
-    private ReplayGate<List<ResultEnvelope>> Gate => _gate ??= new ReplayGate<List<ResultEnvelope>>(
-        OutputStream,
-        release => this.RegisterGrainTimer(release, ReplayGate<List<ResultEnvelope>>.SafetyRelease, Timeout.InfiniteTimeSpan),
-        batch => batch.Count > 0 ? batch[0].TimestampMs : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-        batch => batch.Select(e => new ResultEnvelope { PipelineId = e.PipelineId, Seq = e.Seq, TimestampMs = e.TimestampMs, Row = new Dictionary<string, object?>(e.Row) }).ToList());
+    private ReplayGate<List<ResultEnvelope>> Gate => _gate ??= CreateGate();
+    private ReplayConfig? _gateReplay;
+    private IGrainTimer? _replayFlushTimer;
+
+    /// <summary>Plan 026 D6 — see <see cref="ConnectorGrain"/>'s identical member: the disk tier is attached
+    /// before the first publish (StartAsync sets <see cref="_def"/> before anything can emit), and toggling
+    /// <c>replay.persist</c> drops the gate so this rebuilds it — positions then continue from the disk's own
+    /// <c>LastSeq</c>, or restart at 1 when the tier is turned off.</summary>
+    private ReplayGate<List<ResultEnvelope>> CreateGate()
+    {
+        var gate = new ReplayGate<List<ResultEnvelope>>(
+            OutputStream,
+            release => this.RegisterGrainTimer(release, ReplayGate<List<ResultEnvelope>>.SafetyRelease, Timeout.InfiniteTimeSpan),
+            batch => batch.Count > 0 ? batch[0].TimestampMs : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            batch => batch.Select(e => new ResultEnvelope { PipelineId = e.PipelineId, Seq = e.Seq, TimestampMs = e.TimestampMs, Row = new Dictionary<string, object?>(e.Row) }).ToList());
+        _gateReplay = _def?.Replay;
+        var disk = ReplayPersistence.Open(ServiceProvider, _gateReplay, StreamConstants.OutputNamespace, this.GetPrimaryKeyString());
+        _replayFlushTimer?.Dispose();
+        _replayFlushTimer = null;
+        if (disk is not null)
+        {
+            gate.EnablePersistence(
+                disk,
+                ReplayPayloadJson.Serialize,
+                ReplayPayloadJson.Deserialize<List<ResultEnvelope>>);
+            _replayFlushTimer = this.RegisterGrainTimer(ReplayFlushAsync, ReplayPersistence.FlushPeriod, ReplayPersistence.FlushPeriod);
+        }
+        return gate;
+    }
+
+    private Task ReplayFlushAsync() => _gate?.FlushAsync() ?? Task.CompletedTask;
+
+    /// <summary>Plan 026 D6 — the last write-behind flush; a crash loses only what this would have written.</summary>
+    public override async Task OnDeactivateAsync(DeactivationReason reason, CancellationToken cancellationToken)
+    {
+        try { await ReplayFlushAsync(); } catch { /* best-effort */ }
+        await base.OnDeactivateAsync(reason, cancellationToken);
+    }
 
     // Plan 021 D6 — self-publish onto THIS pipeline's own output stream: this.GetPrimaryKeyString() is
     // already the D3-qualified key (IPipelineGrain is qualified uniformly like every other name/id-keyed
@@ -65,6 +99,17 @@ public sealed class PipelineGrain(ILogger<PipelineGrain> logger) : Grain, IPipel
         await StopAsync();
 
         _def = def;
+        // Plan 026 D6: rebuild the gate when the replay group changed, then attach the disk tier BEFORE the
+        // executor below can emit its first batch.
+        if (_gate is not null && _gateReplay != def.Replay)
+        {
+            await _gate.FlushAsync();
+            _gate = null;
+        }
+        if (def.Replay is { Persist: true })
+        {
+            _ = Gate;
+        }
 
         // Plan 021 D5 — a grain acting on an entity it was just handed reads that entity's OWN Environment
         // field rather than any ambient: def.Environment was stamped by the registry that created it and
@@ -106,6 +151,7 @@ public sealed class PipelineGrain(ILogger<PipelineGrain> logger) : Grain, IPipel
     {
         // Batches already produced are batches already owed — same rule as ConnectorGrain.StopAsync.
         await Gate.ForceReleaseAsync();
+        await ReplayFlushAsync(); // plan 026 D6: the write-behind tail is owed to disk before stopping
 
         _status = PipelineStatus.Stopped;
 
