@@ -148,6 +148,14 @@ public sealed class StreamGrpcService(ICatalogFacade catalog, IEntityStreamFacad
         await WaitForCancellationThenUnsubscribeAsync(handle, context.CancellationToken);
     }
 
+    /// <summary>Plan 026 wave 2 — same replaying-overload-always shape as <see cref="SubscribeSource"/>
+    /// above: <c>from: null</c> when neither wire field is set, so <c>Position</c> is written on every
+    /// batch's rows including the pre-026 live-only path. One BATCH is one <see cref="ReplayFrom"/>
+    /// position; every row it flattens to shares that <see cref="V1.ResultEnvelope.Position"/> while
+    /// <see cref="V1.ResultEnvelope.Seq"/> stays the per-subscription, per-ROW counter it always was.
+    /// <see cref="SubscribeWithReplayBufferAsync{T}"/> carries the buffer-until-truncation-known rule and
+    /// the crdt/unsupported-source refusal mapping identically to <see cref="SubscribeSource"/> — see
+    /// that method's doc for why both exist.</summary>
     [Authorize(Policy = "Viewer")]
     public override async Task SubscribePipeline(
         V1.SubscribePipelineRequest request,
@@ -173,25 +181,50 @@ public sealed class StreamGrpcService(ICatalogFacade catalog, IEntityStreamFacad
 
         // The output stream is keyed by pipeline ID, so a name-addressed subscription resolves to one.
         var pipelineId = subscribed?.Id ?? request.Id;
+        var environment = subscribed?.Environment ?? EnvironmentAmbient.Current;
 
-        var handle = await streams.SubscribePipelineAsync(
-            subscribed?.Environment ?? EnvironmentAmbient.Current, pipelineId, async rows =>
-            {
-                foreach (var row in rows)
+        ReplayFrom? from = request.FromSeq > 0
+            ? new ReplayFrom { Seq = request.FromSeq }
+            : request.FromTimestampMs > 0
+                ? new ReplayFrom { TimestampMs = request.FromTimestampMs }
+                : null;
+
+        long seq = 0;
+        IEntityReplaySubscription handle;
+        try
+        {
+            handle = await SubscribeWithReplayBufferAsync<IReadOnlyList<ResultEnvelope>>(
+                onBatch => streams.SubscribePipelineAsync(environment, pipelineId, from, onBatch),
+                async (rows, position, truncated) =>
                 {
-                    await responseStream.WriteAsync(new V1.ResultEnvelope
+                    var firstRow = true;
+                    foreach (var row in rows)
                     {
-                        PipelineId = row.PipelineId,
-                        Seq = row.Seq,
-                        TimestampMs = row.TimestampMs,
-                        Row = GrpcValueConverter.ToStruct(row.Row),
-                    });
-                }
-            });
+                        await responseStream.WriteAsync(new V1.ResultEnvelope
+                        {
+                            PipelineId = row.PipelineId,
+                            Seq = ++seq,
+                            TimestampMs = row.TimestampMs,
+                            Row = GrpcValueConverter.ToStruct(row.Row),
+                            Position = position,
+                            ReplayTruncated = firstRow && truncated,
+                        });
+                        firstRow = false;
+                    }
+                });
+        }
+        catch (NotSupportedException ex)
+        {
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
 
         await WaitForCancellationThenUnsubscribeAsync(handle, context.CancellationToken);
     }
 
+    /// <summary>Plan 026 wave 2 — the table-delta twin of <see cref="SubscribePipeline"/> above: one
+    /// <see cref="V1.TableDeltaBatch"/> per published batch, carrying its producer
+    /// <see cref="V1.TableDeltaBatch.Position"/>; <see cref="V1.TableDeltaBatch.Seq"/> stays the
+    /// per-subscription batch counter it always was.</summary>
     [Authorize(Policy = "Viewer")]
     public override async Task SubscribeTable(
         V1.SubscribeTableRequest request,
@@ -214,21 +247,115 @@ public sealed class StreamGrpcService(ICatalogFacade catalog, IEntityStreamFacad
             throw new RpcException(new Status(StatusCode.FailedPrecondition, hit.Message));
         }
 
+        var environment = table?.Environment ?? EnvironmentAmbient.Current;
+        ReplayFrom? from = request.FromSeq > 0
+            ? new ReplayFrom { Seq = request.FromSeq }
+            : request.FromTimestampMs > 0
+                ? new ReplayFrom { TimestampMs = request.FromTimestampMs }
+                : null;
+
         long seq = 0;
-        var handle = await streams.SubscribeTableAsync(
-            table?.Environment ?? EnvironmentAmbient.Current, tableName, async deltas =>
-            {
-                seq++;
-                var batch = new V1.TableDeltaBatch { TableName = tableName, Seq = seq };
-                batch.Deltas.AddRange(deltas.Select(d => new V1.TableDelta
+        IEntityReplaySubscription handle;
+        try
+        {
+            handle = await SubscribeWithReplayBufferAsync<IReadOnlyList<TableDeltaDto>>(
+                onBatch => streams.SubscribeTableAsync(environment, tableName, from, onBatch),
+                async (deltas, position, truncated) =>
                 {
-                    Row = GrpcValueConverter.ToStruct(d.Row),
-                    Weight = d.Weight,
-                }));
-                await responseStream.WriteAsync(batch);
-            });
+                    seq++;
+                    var batch = new V1.TableDeltaBatch
+                    {
+                        TableName = tableName,
+                        Seq = seq,
+                        Position = position,
+                        ReplayTruncated = truncated,
+                    };
+                    batch.Deltas.AddRange(deltas.Select(d => new V1.TableDelta
+                    {
+                        Row = GrpcValueConverter.ToStruct(d.Row),
+                        Weight = d.Weight,
+                    }));
+                    await responseStream.WriteAsync(batch);
+                });
+        }
+        catch (NotSupportedException ex)
+        {
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
 
         await WaitForCancellationThenUnsubscribeAsync(handle, context.CancellationToken);
+    }
+
+    /// <summary>Plan 026 wave 2 — the buffer-then-flush dance <see cref="SubscribeSource"/> wrote inline
+    /// (see its own doc comment for WHY: the facade delivers the entire retained snapshot before
+    /// <c>Truncated</c> is knowable, so every item has to be held until the awaited subscribe call returns
+    /// and the flag is known, then flushed in arrival order — a live item racing the replay/live handoff is
+    /// buffered too, landing in its correct position rather than out of order), generalized so
+    /// <see cref="SubscribePipeline"/> and <see cref="SubscribeTable"/> share it instead of repeating the
+    /// semaphore/flag bookkeeping a second and third time. <paramref name="beginSubscribe"/> is the facade
+    /// call itself, handed the one per-item callback (item, position) to pass through;
+    /// <paramref name="writeAsync"/> is invoked once per item, strictly in arrival order, with
+    /// <c>truncated</c> true only for the very first item written (replay or, if nothing was retained,
+    /// the first live one) — exactly <see cref="IEntityReplaySubscription.Truncated"/>'s contract. A
+    /// <see cref="NotSupportedException"/> from <paramref name="beginSubscribe"/> propagates to the
+    /// caller, which maps it to <see cref="StatusCode.FailedPrecondition"/> like <see cref="SubscribeSource"/>
+    /// does.</summary>
+    private static async Task<IEntityReplaySubscription> SubscribeWithReplayBufferAsync<T>(
+        Func<Func<T, long, Task>, Task<IEntityReplaySubscription>> beginSubscribe,
+        Func<T, long, bool, Task> writeAsync)
+    {
+        var writeGate = new SemaphoreSlim(1, 1);
+        var buffered = new List<(T Item, long Position)>();
+        var flushed = false;
+        var truncateNextLive = false;
+
+        var handle = await beginSubscribe(async (item, position) =>
+        {
+            await writeGate.WaitAsync();
+            try
+            {
+                if (!flushed)
+                {
+                    buffered.Add((item, position));
+                    return;
+                }
+
+                var truncated = truncateNextLive;
+                truncateNextLive = false;
+                await writeAsync(item, position, truncated);
+            }
+            finally
+            {
+                writeGate.Release();
+            }
+        });
+
+        await writeGate.WaitAsync();
+        try
+        {
+            if (buffered.Count > 0)
+            {
+                var first = true;
+                foreach (var (item, position) in buffered)
+                {
+                    await writeAsync(item, position, first && handle.Truncated);
+                    first = false;
+                }
+            }
+            else if (handle.Truncated)
+            {
+                // Nothing retained matched the request — surface the truncation on the first LIVE item
+                // rather than lose it silently.
+                truncateNextLive = true;
+            }
+            flushed = true;
+        }
+        finally
+        {
+            writeGate.Release();
+        }
+
+        return handle;
     }
 
     /// <summary>Keeps the RPC alive until the client disconnects/cancels (context.CancellationToken),

@@ -159,18 +159,88 @@ public sealed class OrleansEntityStreamFacade(IClusterClient client) : IEntitySt
         return new Handle<List<TableDeltaDto>>(await stream.SubscribeAsync((deltas, _) => onDeltas(deltas)));
     }
 
-    /// <summary>Plan 026 wave 2 — STUBS pinned by the orchestrator so both hosts build; wave 2 agent A
-    /// replaces them with the gated implementation over <see cref="IPipelineGrain"/>/<see cref="ITableGrain"/>
-    /// (key = qualified pipeline ID / qualified table NAME), mirroring the source overload above.</summary>
-    public Task<IEntityReplaySubscription> SubscribePipelineAsync(
+    /// <summary>Plan 026 wave 2 — the batch-grained twin of the source overload above; see its doc for the
+    /// full protocol (Begin → subscribe → feed the retained snapshot → End in a <c>finally</c>, live
+    /// positions counted from the snapshot's <c>LastSeq</c>, the same one-pull-period drift note). A batch
+    /// IS the stream item here (no per-row position — <see cref="ResultEnvelope.Seq"/> stays the
+    /// per-subscription row counter the caller assigns), and the key is always
+    /// <c>IPipelineGrain</c>/qualified pipeline ID — no catalog lookup, unlike the source overload, because
+    /// there is exactly one grain kind behind a pipeline.</summary>
+    public async Task<IEntityReplaySubscription> SubscribePipelineAsync(
         string environment, string pipelineId, ReplayFrom? from,
-        Func<IReadOnlyList<ResultEnvelope>, long, Task> onResults) =>
-        throw new NotImplementedException("plan 026 wave 2 agent A");
+        Func<IReadOnlyList<ResultEnvelope>, long, Task> onResults)
+    {
+        var qualified = EnvKeys.Qualify(environment, pipelineId);
+        var stream = client.GetStreamProvider(StreamConstants.ProviderName)
+            .GetStream<List<ResultEnvelope>>(StreamId.Create(StreamConstants.OutputNamespace, qualified));
 
-    public Task<IEntityReplaySubscription> SubscribeTableAsync(
+        if (from is null)
+        {
+            long live = 0;
+            var liveHandle = await stream.SubscribeAsync((rows, _) => onResults(rows, ++live));
+            return new ReplaySubscriptionHandle(new Handle<List<ResultEnvelope>>(liveHandle), firstSeq: 1, lastSeq: 0, truncated: false);
+        }
+
+        var grain = client.GetGrain<IPipelineGrain>(qualified);
+        var snapshot = await grain.BeginAttachAsync(from);
+        try
+        {
+            long live = 0;
+            var handle = await stream.SubscribeAsync((rows, _) => onResults(rows, snapshot.LastSeq + ++live));
+
+            for (var i = 0; i < snapshot.Items.Count; i++)
+            {
+                await onResults(snapshot.Items[i], snapshot.Positions[i]);
+            }
+
+            return new ReplaySubscriptionHandle(new Handle<List<ResultEnvelope>>(handle), snapshot.FirstSeq, snapshot.LastSeq, snapshot.Truncated);
+        }
+        finally
+        {
+            await grain.EndAttachAsync();
+        }
+    }
+
+    /// <summary>Plan 026 wave 2 — the batch-grained twin of the source overload above, over
+    /// <see cref="ITableGrain"/>/qualified table NAME; see that overload's doc for the full protocol. A
+    /// coordinator-mode table's <c>BeginAttachAsync</c> returns an empty, <c>Truncated</c> snapshot when a
+    /// position was asked for (see <see cref="ITableGrain.EndAttachAsync"/>'s doc) — this method has no
+    /// special case for that, it just feeds whatever the gate hands back, which for that case is
+    /// nothing.</summary>
+    public async Task<IEntityReplaySubscription> SubscribeTableAsync(
         string environment, string tableName, ReplayFrom? from,
-        Func<IReadOnlyList<TableDeltaDto>, long, Task> onDeltas) =>
-        throw new NotImplementedException("plan 026 wave 2 agent A");
+        Func<IReadOnlyList<TableDeltaDto>, long, Task> onDeltas)
+    {
+        var qualified = EnvKeys.Qualify(environment, tableName);
+        var stream = client.GetStreamProvider(StreamConstants.ProviderName)
+            .GetStream<List<TableDeltaDto>>(StreamId.Create(StreamConstants.TableDeltaNamespace, qualified));
+
+        if (from is null)
+        {
+            long live = 0;
+            var liveHandle = await stream.SubscribeAsync((deltas, _) => onDeltas(deltas, ++live));
+            return new ReplaySubscriptionHandle(new Handle<List<TableDeltaDto>>(liveHandle), firstSeq: 1, lastSeq: 0, truncated: false);
+        }
+
+        var grain = client.GetGrain<ITableGrain>(qualified);
+        var snapshot = await grain.BeginAttachAsync(from);
+        try
+        {
+            long live = 0;
+            var handle = await stream.SubscribeAsync((deltas, _) => onDeltas(deltas, snapshot.LastSeq + ++live));
+
+            for (var i = 0; i < snapshot.Items.Count; i++)
+            {
+                await onDeltas(snapshot.Items[i], snapshot.Positions[i]);
+            }
+
+            return new ReplaySubscriptionHandle(new Handle<List<TableDeltaDto>>(handle), snapshot.FirstSeq, snapshot.LastSeq, snapshot.Truncated);
+        }
+        finally
+        {
+            await grain.EndAttachAsync();
+        }
+    }
 
     private sealed class Handle<T>(StreamSubscriptionHandle<T> handle) : IAsyncDisposable
     {
