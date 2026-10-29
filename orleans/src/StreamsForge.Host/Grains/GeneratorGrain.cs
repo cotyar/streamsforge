@@ -109,6 +109,9 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
         // Wishlist #9(b): attach + arm the drain loop BEFORE the early EventsPerSecond<=0 return below —
         // a scenario/loopback-target source with EventsPerSecond == 0 must still be reachable.
         var sourceName = this.GetPrimaryKeyString();
+        // The loopback timer must survive an empty input queue: writing to LoopbackHub does not make
+        // a grain call and cannot reactivate a collected generator (whose definition is in memory).
+        this.DelayDeactivation(Timeout.InfiniteTimeSpan);
         LoopbackHub.Attach(sourceName);
         _loopbackDrainTimer = this.RegisterGrainTimer(DrainLoopbackAsync, LoopbackDrainPeriod, LoopbackDrainPeriod);
 
@@ -134,6 +137,7 @@ public sealed class GeneratorGrain : Grain, IGeneratorGrain
         // failure by the caller — see LoopbackHub.Detach's doc comment.
         LoopbackHub.Detach(this.GetPrimaryKeyString());
         _runStates.Clear();
+        this.DelayDeactivation(TimeSpan.Zero);
     }
 
     public Task PingAsync() => Task.CompletedTask;

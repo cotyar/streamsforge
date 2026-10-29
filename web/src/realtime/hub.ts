@@ -13,13 +13,10 @@ type MetricsHandler = (metrics: PipelineMetrics) => void
 type SourceHandler = (row: ResultRow) => void
 type TableDeltaHandler = (deltas: TableRowDto[], seq: number) => void
 type Unsubscribe = () => void
-/** Returned by subscribeTable() in addition to the plain Unsubscribe -- `ready` resolves once
- * `SubscribeTable` has been confirmed by the server on the CURRENT connection (or rejects if that
- * invocation fails), so a caller that needs the hard guarantee (no snapshot read before the
- * subscription is actually registered) can `await unsub.ready` first. Callers that don't care --
- * every existing one except useTableRows.ts -- keep working unchanged: it's still a plain callable
- * used as a useEffect cleanup function, `ready` is just an extra property nobody has to read. */
-type TableUnsubscribe = Unsubscribe & { ready: Promise<void> }
+/** A callable cleanup with a current-connection subscription acknowledgement. Readers
+ * can await `.ready` before taking a snapshot; callers needing only deltas use the
+ * cleanup as before. Reconnect re-arms the getter for both pipelines and tables. */
+type ReadyUnsubscribe = Unsubscribe & { ready: Promise<void> }
 
 let connection: signalR.HubConnection | null = null
 let connectPromise: Promise<signalR.HubConnection> | null = null
@@ -27,9 +24,18 @@ let connectPromise: Promise<signalR.HubConnection> | null = null
 const pipelineRowHandlers = new Map<string, Set<RowsHandler>>()
 const pipelineStatusHandlers = new Map<string, Set<StatusHandler>>()
 const pipelineRefCounts = new Map<string, number>()
+const pipelineReadyPromises = new Map<string, Promise<void>>()
 
 const sourceHandlers = new Map<string, Set<SourceHandler>>()
 const sourceRefCounts = new Map<string, number>()
+
+const reconnectHandlers = new Set<() => void>()
+
+/** Recover snapshots after reconnect starts restoring groups; table readers await their own ready. */
+export function onHubReconnected(handler: () => void): Unsubscribe {
+  reconnectHandlers.add(handler)
+  return () => { reconnectHandlers.delete(handler) }
+}
 
 const metricsHandlers = new Set<MetricsHandler>()
 let metricsRefCount = 0
@@ -60,13 +66,15 @@ function registerListeners(conn: signalR.HubConnection) {
 
   conn.onreconnected(() => {
     for (const id of pipelineRefCounts.keys()) {
-      void conn.invoke('subscribePipeline', id)
+      const rearmed = conn.invoke('subscribePipeline', id)
+      rearmed.catch(() => {})
+      pipelineReadyPromises.set(id, rearmed)
     }
     for (const name of sourceRefCounts.keys()) {
-      void conn.invoke('subscribeSource', name)
+      void conn.invoke('subscribeSource', name).catch(() => {})
     }
     if (metricsRefCount > 0) {
-      void conn.invoke('subscribeMetrics')
+      void conn.invoke('subscribeMetrics').catch(() => {})
     }
     // Re-arms tableReadyPromises too (not just fire-and-forget), so a `.ready` read shortly after
     // a reconnect reflects the CURRENT connection's registration rather than a stale promise that
@@ -80,6 +88,7 @@ function registerListeners(conn: signalR.HubConnection) {
       })
       tableReadyPromises.set(name, rearmed)
     }
+    reconnectHandlers.forEach((handler) => handler())
   })
 }
 
@@ -186,8 +195,10 @@ export async function disconnectHub(): Promise<void> {
   pipelineRowHandlers.clear()
   pipelineStatusHandlers.clear()
   pipelineRefCounts.clear()
+  pipelineReadyPromises.clear()
   sourceHandlers.clear()
   sourceRefCounts.clear()
+  reconnectHandlers.clear()
   metricsHandlers.clear()
   metricsRefCount = 0
   tableDeltaHandlers.clear()
@@ -202,7 +213,7 @@ export async function disconnectHub(): Promise<void> {
   }
 }
 
-export function subscribePipeline(id: string, onRows: RowsHandler, onStatus?: StatusHandler): Unsubscribe {
+export function subscribePipeline(id: string, onRows: RowsHandler, onStatus?: StatusHandler): ReadyUnsubscribe {
   if (!pipelineRowHandlers.has(id)) pipelineRowHandlers.set(id, new Set())
   pipelineRowHandlers.get(id)!.add(onRows)
   if (onStatus) {
@@ -213,16 +224,19 @@ export function subscribePipeline(id: string, onRows: RowsHandler, onStatus?: St
   const wasZero = (pipelineRefCounts.get(id) ?? 0) === 0
   pipelineRefCounts.set(id, (pipelineRefCounts.get(id) ?? 0) + 1)
 
+  let ready: Promise<void>
   if (wasZero) {
-    void getConnection().then((conn) => {
-      if ((pipelineRefCounts.get(id) ?? 0) > 0) {
-        void conn.invoke('subscribePipeline', id)
-      }
+    ready = getConnection().then(async (conn) => {
+      if (pipelineRowHandlers.get(id)?.has(onRows)) await conn.invoke('subscribePipeline', id)
     })
+    ready.catch(() => {})
+    pipelineReadyPromises.set(id, ready)
+  } else {
+    ready = pipelineReadyPromises.get(id) ?? Promise.resolve()
   }
 
   let done = false
-  return () => {
+  const unsubscribe = (() => {
     if (done) return
     done = true
     pipelineRowHandlers.get(id)?.delete(onRows)
@@ -230,13 +244,18 @@ export function subscribePipeline(id: string, onRows: RowsHandler, onStatus?: St
     const next = Math.max(0, (pipelineRefCounts.get(id) ?? 1) - 1)
     if (next === 0) {
       pipelineRefCounts.delete(id)
+      pipelineReadyPromises.delete(id)
       pipelineRowHandlers.delete(id)
       pipelineStatusHandlers.delete(id)
       if (connection) void connection.invoke('unsubscribePipeline', id)
     } else {
       pipelineRefCounts.set(id, next)
     }
-  }
+  }) as ReadyUnsubscribe
+  Object.defineProperty(unsubscribe, 'ready', {
+    get: () => pipelineReadyPromises.get(id) ?? ready,
+  })
+  return unsubscribe
 }
 
 export function subscribeSource(name: string, onEvent: SourceHandler): Unsubscribe {
@@ -293,7 +312,7 @@ export function subscribeSource(name: string, onEvent: SourceHandler): Unsubscri
  * connect/invoke ever happen, so nothing arriving after registration is ever missed — only the
  * window before registration completes was the gap. `.ready` is additive: every existing caller
  * that doesn't read it (ApiExplorerPage.tsx) keeps using the return value as a plain callable. */
-export function subscribeTable(name: string, onDeltas: TableDeltaHandler): TableUnsubscribe {
+export function subscribeTable(name: string, onDeltas: TableDeltaHandler): ReadyUnsubscribe {
   if (!tableDeltaHandlers.has(name)) tableDeltaHandlers.set(name, new Set())
   tableDeltaHandlers.get(name)!.add(onDeltas)
 
@@ -335,8 +354,10 @@ export function subscribeTable(name: string, onDeltas: TableDeltaHandler): Table
     } else {
       tableRefCounts.set(name, next)
     }
-  }) as TableUnsubscribe
-  unsubscribe.ready = ready
+  }) as ReadyUnsubscribe
+  Object.defineProperty(unsubscribe, 'ready', {
+    get: () => tableReadyPromises.get(name) ?? ready,
+  })
   return unsubscribe
 }
 

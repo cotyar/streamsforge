@@ -253,6 +253,12 @@ failure backoff) decide when the next cycle runs. `grpc` is not a poll — `Grpc
 `DynamicStreamService`, decoding frames with the new `ProtoWireDecoder` (the encoder's exact
 counterpart, `AppCore/Protocol/ProtoWireDecoder.cs`).
 
+Running `GeneratorGrain` and `ConnectorGrain` activations retain themselves with
+`DelayDeactivation(Timeout.InfiniteTimeSpan)` until `StopAsync` restores normal collection.
+Timer ticks, loopback queues and external session traffic cannot reactivate a collected driver;
+the supervisor's 15-second pings are an additional safeguard, not the lifetime guarantee.
+Ingest publishing is a grain call and can reactivate its producer normally.
+
 `ConnectorGrain` (`orleans/src/StreamsForge.Host/Grains/ConnectorGrain.cs`, key = source name) is
 the thin driver: `[PersistentState("connector", …)]` holds `SourceDefinition`, `Running`, the
 dedup/ledger trackers' persistable snapshots, and every `ConnectorRuntimeStatus` field. url/file/

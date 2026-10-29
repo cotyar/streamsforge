@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PipelineStatus, ResultEnvelope } from '../api/types'
 import { pipelinesApi } from '../api/pipelines'
-import { subscribePipeline } from '../realtime/hub'
+import { onHubReconnected, subscribePipeline } from '../realtime/hub'
+import { mergePipelineResults, refreshAfterSubscription } from '../realtime/snapshot'
 
 const MAX_ROWS = 200
 
@@ -25,20 +26,26 @@ export function usePipelineResults(pipelineId: string | undefined) {
     setLoading(true)
     let cancelled = false
 
-    pipelinesApi
-      .results(pipelineId, 50)
-      .then((initial) => {
-        if (cancelled) return
-        const ordered = [...initial].sort((a, b) => b.seq - a.seq)
-        for (const r of ordered) seenSeqs.current.add(r.seq)
-        setRows(ordered)
-      })
-      .catch(() => {
-        // best-effort — the live stream still populates rows going forward
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
+    let refreshVersion = 0
+    const refresh = () => {
+      const version = ++refreshVersion
+      return pipelinesApi
+        .results(pipelineId, 50)
+        .then((initial) => {
+          if (cancelled || version !== refreshVersion) return
+          const ordered = [...initial].sort((a, b) => b.seq - a.seq)
+          for (const r of ordered) seenSeqs.current.add(r.seq)
+          // A REST response can arrive after live rows. Preserve those rows while
+          // merging the retained server buffer, including after a reconnect.
+          setRows((prev) => mergePipelineResults(prev, ordered, MAX_ROWS))
+        })
+        .catch(() => {
+          // best-effort — the live stream still populates rows going forward
+        })
+        .finally(() => {
+          if (!cancelled && version === refreshVersion) setLoading(false)
+        })
+    }
 
     const unsub = subscribePipeline(
       pipelineId,
@@ -51,8 +58,16 @@ export function usePipelineResults(pipelineId: string | undefined) {
       (s) => setStatus(s),
     )
 
+    let stopWaiting = refreshAfterSubscription(unsub.ready, () => { void refresh() })
+    const stopRefresh = onHubReconnected(() => {
+      stopWaiting()
+      stopWaiting = refreshAfterSubscription(unsub.ready, () => { void refresh() })
+    })
+
     return () => {
       cancelled = true
+      stopWaiting()
+      stopRefresh()
       unsub()
     }
   }, [pipelineId])

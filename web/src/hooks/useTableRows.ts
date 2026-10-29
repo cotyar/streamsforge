@@ -3,7 +3,8 @@ import { ZSet } from '@streamsforge/client'
 import type { Row as LiveTableRow } from '@streamsforge/client'
 import type { ResultRow, TableRowDto } from '../api/types'
 import { tablesApi } from '../api/tables'
-import { subscribeTable } from '../realtime/hub'
+import { onHubReconnected, subscribeTable } from '../realtime/hub'
+import { refreshAfterSubscription } from '../realtime/snapshot'
 
 export interface LiveRow {
   /** Canonical Z-set tuple identity -- see @streamsforge/client's canonicalKey(). */
@@ -147,57 +148,64 @@ export function useTableRows(
       flushToState()
     })
 
-    // Await registration (`.ready`, set by hub.ts's subscribeTable()) before issuing the snapshot
-    // read. hub.ts's `SubscribeTable` invoke resolves only once the server confirms this
-    // connection is in the table's SignalR group (StreamHub.SubscribeTable returns
-    // Groups.AddToGroupAsync itself), so this is a hard guarantee, not a timing heuristic: no
-    // delta broadcast can land in the window between subscribing and the read anymore, because
-    // there IS no such window -- the read doesn't start until registration is confirmed.
-    //
-    // The buffer-and-replay dance below stays necessary even so -- it now covers a strictly
-    // smaller window (registration confirmed -> GET /rows response actually arriving) rather than
-    // the old, unbounded one (subscribeTable() called -> registration confirmed, of unknown
-    // duration), but that window is real (a delta can still be broadcast while the REST call is
-    // in flight) and arrival order between it and the snapshot is still not guaranteed, so
-    // `alreadyReflected()`'s reconciliation is still exactly what closes it.
-    unsub.ready
-      .catch(() => {
-        // best-effort -- if registration itself failed (e.g. the connection dropped mid-handshake),
-        // still read the snapshot so the view isn't left empty; live deltas won't arrive until
-        // hub.ts's onreconnected() re-establishes the subscription on a fresh connection.
-      })
-      .then(() => {
-        if (cancelled) return undefined
-        return tablesApi.rows(tableId, 500)
-      })
-      .then((res) => {
-        if (cancelled || !res) return
-        zsetRef.current.seed(toDeltaTuples(res.rows))
-        setSnapshotTotal(res.totalRows)
+    // Prefer an acknowledged subscription before reading. Buffer deltas while each
+    // snapshot is in flight, then reconcile them against the response. A reconnect
+    // starts a fresh read; its generation prevents an older response replacing it.
+    let refreshVersion = 0
+    const refreshSnapshot = () => {
+      const version = ++refreshVersion
+      buffering = true
+      buffered.length = 0
+      return tablesApi.rows(tableId, 500)
+        .then((res) => {
+          if (cancelled || version !== refreshVersion || !res) return
+          zsetRef.current.seed(toDeltaTuples(res.rows))
+          setSnapshotTotal(res.totalRows)
 
-        // Replay in arrival order (reliably chronological -- single SignalR connection), skipping
-        // batches whose transition already happened before the snapshot was taken.
-        for (const b of buffered) {
-          if (!zsetRef.current.alreadyReflected(toDeltaTuples(b.deltas))) {
-            applyBatch(b.deltas, false)
+          // Replay in arrival order (reliably chronological -- single SignalR connection), skipping
+          // batches whose transition already happened before the snapshot was taken.
+          for (const b of buffered) {
+            if (!zsetRef.current.alreadyReflected(toDeltaTuples(b.deltas))) {
+              applyBatch(b.deltas, false)
+            }
           }
-        }
 
-        buffering = false
-        flushToState()
-        setLive(true)
-      })
-      .catch(() => {
-        // best-effort -- once buffering flips off, live deltas still populate the view
-        buffering = false
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
+          buffering = false
+          flushToState()
+        })
+        .catch(() => {
+          // best-effort -- once buffering flips off, live deltas still populate the view
+          if (!cancelled && version === refreshVersion) buffering = false
+        })
+        .finally(() => {
+          if (!cancelled && version === refreshVersion) setLoading(false)
+        })
+    }
+
+    // Reading an idle table must not depend on a WebSocket handshake finishing.
+    // If registration is slow, show a REST snapshot; once registration does finish,
+    // take another buffered snapshot to close the fallback's subscription gap.
+    let registrationVersion = 0
+    const recover = () => {
+      const version = ++registrationVersion
+      setLive(false)
+      const ready = unsub.ready
+      void ready.then(() => {
+        if (!cancelled && version === registrationVersion) setLive(true)
+      }).catch(() => {})
+      return refreshAfterSubscription(ready, () => { void refreshSnapshot() })
+    }
+    let stopWaiting = recover()
+    const stopRefresh = onHubReconnected(() => {
+      stopWaiting()
+      stopWaiting = recover()
+    })
 
     return () => {
       cancelled = true
       if (flashTimer) clearTimeout(flashTimer)
+      stopWaiting()
+      stopRefresh()
       unsub()
     }
     // keyFieldsDepKey (not keyFields itself -- see its own comment above) intentionally re-keys

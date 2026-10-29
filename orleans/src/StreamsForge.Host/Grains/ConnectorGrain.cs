@@ -191,6 +191,7 @@ public sealed class ConnectorGrain(
     {
         if (state.State.Running && state.State.Def is not null)
         {
+            this.DelayDeactivation(Timeout.InfiniteTimeSpan);
             EnsureTrackers();
             ArmForKind(state.State.Def, persistNextRun: false);
         }
@@ -221,6 +222,9 @@ public sealed class ConnectorGrain(
         state.State.Def = def;
         await RebuildGateIfReplayChangedAsync();
         state.State.Running = true;
+        // Grain timers and background transport subscriptions do not count as activity for Orleans GC.
+        // External arrivals cannot reactivate a collected poller/session, so retain it until stopped.
+        this.DelayDeactivation(Timeout.InfiniteTimeSpan);
         // A (re)start is the operator saying "try this definition now". Carrying the old failure streak
         // across it meant a source that had backed off to minutes kept waiting out that backoff even
         // after the config that caused the failures was fixed — a PUT, a config import and a
@@ -260,6 +264,7 @@ public sealed class ConnectorGrain(
         CancelGrpc();
         CancelTransport();
         await state.WriteStateAsync();
+        this.DelayDeactivation(TimeSpan.Zero);
     }
 
     public Task PingAsync() => Task.CompletedTask;
