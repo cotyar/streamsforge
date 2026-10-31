@@ -1,6 +1,6 @@
 # 026 — Stream replay: subscribe from a position in the past, on any persistence mode
 
-Status: **waves 1–2 DONE on Orleans** (2026-09-14); waves 3–4 planned. Dapr gets a PARITY line per wave and its own port later (`dapr/PARITY.md` § 2b D11).
+Status: **waves 1–3 DONE on Orleans** (2026-09-14); wave 4 (SDKs, console) planned. Dapr gets a PARITY line per wave and its own port later (`dapr/PARITY.md` § 2b D11).
 
 ## Why
 
@@ -221,6 +221,56 @@ Acceptance:
   and `Changing_replayFrom_on_a_running_table_restarts_it`): both count rows after a 2 s quiesce sized
   for an idle machine; under a 12-minute whole-solution run the pull agent lagged far enough that rows
   arrived live AND replayed (plan 023's gap). Pass alone; listed in AGENTS.md's flake paragraph.
+
+### Wave 3 (2026-09-14; orchestrator pre-wave `379dc65`, agent A `dfeecc5`, agent C `69dbf02`, agent B `d983bfd`, fixes `820bc9e`/`83e0d29`, merges `95cb196`/`b937b4f`/`6df9db2`)
+
+- **Pre-wave (orchestrator).** `ReplayConfig { persist, retainMs, maxBytes }` on all three definitions
+  (Source `[Id(17)]`, Pipeline `[Id(20)]`, Table `[Id(38)]`), `ReplayStatus` + `IReplayStatusFacade`
+  (Orleans real, Dapr → `NotSupported` → 501), `GetReplayStatusAsync` on every producer grain,
+  `ReplayOptions` (`Replay:SegmentBytes` 8 MB / `RetainMs` 0 / `MaxBytesPerStream` 256 MB; directory
+  `DataDir/replay`), the pinned `ReplaySegmentLog` + `ReplayPayloadJson` surface, and the disk tier
+  inside `ReplayLog<T>` (positions continue from the disk's `LastSeq`; a snapshot the ring cannot
+  serve reads the segments first; `Truncated` now means "before what the DISK still has").
+- **Agent A** — `ReplaySegmentLog` bodies: `NNNNNN.ndjson` segments with a per-segment (first, last,
+  newestAt) index, lazy rotation, whole-segment age/byte retention that never touches the newest
+  segment, torn-last-line tolerance on open, single-flight flush with the buffer swapped before the
+  first await. 10 tests incl. 25 000 entries → 2+ segments and `ReadFrom(12345)` = 12 656, reopen
+  recovers, 1 M entries under `MaxBytes = 64 MB` never exceed 64 MB + one segment. Found: JSON has one
+  number type, so `2.0` came back as `2` (long) — fixed in `820bc9e` by writing integral doubles with
+  an explicit `.0`.
+- **Agent C** — `ConfigPipeline`/`ConfigTable` carry `replayFrom` + `replay` (export omits empty,
+  import applies, validate reports), and the revision projection includes both, so the wave 2 gap
+  ("a `replayFrom` edit does not bump `Revision`") is closed; `GET /api/{sources|pipelines|tables}/{key}/replay`
+  (id-or-name, read entitlement, 501 on Dapr) + `sf replay <kind> <key>`; operator docs
+  (`orleans/docs/index.html` § Stream replay), `orleans/ARCHITECTURE.md`, `TRANSPORTS.md`, PARITY D11.
+  Found: the orchestrator's `OrleansReplayStatusFacade` resolved a table by id — fixed (`83e0d29`).
+- **Agent B** — `ReplayPersistence` (one place a `replay.persist` flag becomes a segment log at
+  `{Replay:Directory}/<ns>/<sanitized key>/`, JsonFileGrainStorage's `[^A-Za-z0-9_.-] → _` rule);
+  the five grains open the tier BEFORE their first publish (connector on activation + start,
+  generator/pipeline/table on start, ingest by resolving its own definition on activation), flush on a
+  dedicated 2 s timer + `StopAsync` + `OnDeactivateAsync` (separate from `TableGrain._flushTimer`,
+  which `MemoryOnly` never arms); a `replay` change restarts a Running table/pipeline (sources restart
+  on every upsert already). **D8:** a table attaches from the START of retention to every input whose
+  producer has `replay.persist`, regardless of kind and of `replayFrom`, and clears `Rebuilding` when
+  every stream input was fed that way. Design correction: NOT gated on `_rebuilding` — a `MemoryOnly`
+  table never sets it, so the acceptance case would have been unreachable; `replay.persist` is opt-in,
+  so nothing that did not opt in changes. Tests: `ReplayPersistenceClusterTests` (3; real file storage
+  sidesteps the plans/022 `CodecNotFoundException` on reactivation, so the on-disk replay after
+  `ForceActivationCollection` IS asserted in-cluster) and `StreamsForge.Chain.Tests.ReplayRestartTests`
+  (ports 8599/8699, silo 18599/38599 — the plan's 6899/6999 were taken): 200 rows through a persisted
+  `url` source, listener switched to `[]`, `Kill`, restart on the same DataDir → `SubscribeSource{from_seq: 1}`
+  over `grpcurl` yields positions 1..200 untruncated, the `MemoryOnly` table over it refills to 200 with
+  `rebuilding == false`, the control table over a plain source comes back with 0 (the pre-plan
+  behaviour, asserted), and `/api/sources/{name}/replay` reports `persisted`/`firstSeq 1`/`lastSeq 200`.
+- **Found and not fixed:** (1) coordinator-mode `TableIngestGrain` did not get D8 — it has no
+  `_rebuilding` of its own and would need an additive parameter on the frozen `ITableIngestGrain.StartAsync`
+  plus a success channel back to `TableGrain`; coordinator-mode tables also still publish from
+  `TableOutputGrain`, so their delta log stays unpersisted. (2) `IngestSourceGrain` reads its `replay`
+  group once on activation (no definition of its own, no restart on upsert) — a toggle takes effect at
+  the next activation. (3) `ReplaySegmentLog.FirstSeq` is flushed-only, so `ReplayStatus.Segments`/
+  `RetainedBytes` read 0 until the first 2 s tick. (4) A stranded test host on 6599 (spawned by agent
+  C's own whole-solution run in its worktree) made the four `TlsHostTests` skip in agent B's run —
+  killed by port after the merge; nothing in the code.
 
 ## Gates (every wave)
 

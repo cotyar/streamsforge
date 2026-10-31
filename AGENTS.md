@@ -243,8 +243,21 @@ restarts it; a named source input (connector, generator or ingest) or pipeline i
 that position, an unnamed one keeps the pre-026 path; a table input, an unknown input or a crdt
 source is refused at create/update. A `replayFrom` edit does not bump `Revision` (the config
 projection does not carry it yet — wave 3). Dapr stores `replayFrom` but `TableActor`/`PipelineActor`
-refuse to start with it set, like `shardBy`. Plan, decisions D1–D9 and per-wave outcomes:
-`plans/026-stream-replay.md`.
+refuse to start with it set, like `shardBy`. **Wave 3** made positions durable: `replay: { persist,
+retainMs, maxBytes }` on a source/pipeline/table turns on an append-only NDJSON segment log under
+`DataDir/replay/<ns>/<key>/` (host knobs `Replay:SegmentBytes` 8 MB, `Replay:RetainMs`,
+`Replay:MaxBytesPerStream` 256 MB; whole-segment retention; flushed every 2 s and on stop/deactivate,
+so a crash loses ≤ 2 s like `Batched`), `GET /api/{kind}/{key}/replay` reports
+`firstSeq/lastSeq/retainedBytes/persisted` (501 on Dapr), `sf replay <kind> <key>` prints it, and
+`replayFrom`/`replay` now round-trip through config export/import AND bump `Revision`. **D8:** a table
+attaches from the START of retention to every input whose producer has `replay.persist` and clears
+`rebuilding` once every stream input was fed that way — the one way a `MemoryOnly` table (or any
+table's operator state) comes back after a restart; proven at process level by
+`StreamsForge.Chain.Tests.ReplayRestartTests`. Gotchas: an integral double is written as `2.0` so a
+column's CLR type survives (`ReplayPayloadJson`); `ReplaySegmentLog.FirstSeq`/`Segments`/`RetainedBytes`
+read 0 until the first flush tick; an ingest source reads its `replay` group only on activation;
+coordinator-mode tables (Parallelism ≥ 2) neither persist their delta log nor get D8. Plan, decisions
+D1–D9 and per-wave outcomes: `plans/026-stream-replay.md`.
 
 **Environment isolation** (plan 021): an environment is the **registry KEY**, not a column — Orleans
 activates a whole separate `RegistryGrain` per environment (Dapr: `RegistryActor`), so two same-named
@@ -297,7 +310,8 @@ the `/sf-env` skill; per-wave outcomes and the found-and-not-fixed list at the e
   second host on the same machine also needs its own `--Silo:Port`/`--Silo:GatewayPort` (defaults
   11111/30000). Reserved by tests: 9199/9299 (`clients/dotnet`, python, kotlin), 8199/8299
   (`clients/typescript`), 7511/7512 (`tools/soak`), and `orleans/tests/StreamsForge.Chain.Tests`'
-  spawned hosts 9399/9499 + 9599/9699 (two-host gRPC chain) and 9799/9899 (restart), silo
+  spawned hosts 9399/9499 + 9599/9699 (two-host gRPC chain), 9799/9899 (restart) and 8599/8699
+  (replay restart, plan 026; silo 18599/38599), silo
   11399/30399, 11599/30599, 11799/30799. TLS tests (plan 024): the Chain project's 6599/6699
   (TLS host), 6999/7099 (TLS startup failure), 8799/8899 + 8999/9099 (TLS two-host chain),
   6799/6899 + 7199/7299 (forwarded headers), silo 16599/36599, 16999/36999, 18799/38799,

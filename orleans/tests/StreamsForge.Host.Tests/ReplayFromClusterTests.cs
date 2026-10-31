@@ -359,13 +359,10 @@ public sealed class ReplayFromClusterTests : IAsyncLifetime
         Assert.NotNull(updated);
         Assert.Equal(PipelineStatus.Running, updated!.Status);
 
-        // NOT asserted: a Revision bump. `CatalogRevisions.DefinitionChanged` compares the CONFIG
-        // projection (`ConfigTable`), and `replayFrom` is not in it — the same documented ceiling
-        // Persistence/FlushMs/JournalMaxEntries already sit on (see CatalogRevisions' own ponytail
-        // paragraph). Widening that projection is a change to the config export contract and belongs with
-        // wave 3, which owns the `replay` group's round-trip. The RESTART below is what D5 is actually
-        // about, and it does not go through the revision counter at all.
-        Assert.Equal(before.Revision, updated.Revision);
+        // Plan 026 wave 3 put `replayFrom` into the config projection `CatalogRevisions.DefinitionChanged`
+        // compares (wave 2 had documented the gap here), so the edit now bumps Revision like any other
+        // definition change. The RESTART below is still what D5 is actually about.
+        Assert.Equal(before.Revision + 1, updated.Revision);
 
         // The restart is what is actually observable: a fresh executor replayed from position 1 instead
         // of 401, so the table now holds all 500 rows rather than the 100 it was built with.
@@ -402,8 +399,8 @@ public sealed class ReplayFromClusterTests : IAsyncLifetime
         });
         Assert.NotNull(updated);
         Assert.Equal(PipelineStatus.Running, updated!.Status);
-        // Same config-projection ceiling as the table twin above — see its comment.
-        Assert.Equal(before.Revision, updated.Revision);
+        // Same as the table twin above — wave 3 put `replayFrom` into the revision projection.
+        Assert.Equal(before.Revision + 1, updated.Revision);
 
         // The counters are cumulative across a restart (they live on the activation, not the executor),
         // so "restarted and replayed from 1" reads as 100 + 500.

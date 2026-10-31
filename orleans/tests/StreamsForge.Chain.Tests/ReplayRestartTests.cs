@@ -168,6 +168,20 @@ public sealed class ReplayRestartTests : IAsyncLifetime
 
             // (a) D6 — positions survived the process.
             await AssertGrpcReplayAsync(client, host);
+
+            // (c) the operator-facing view of the same fact (wave 3 agent C's route): the persisted
+            // source reports its disk tier and the positions a client can ask for; the plain one does not.
+            using (var replay = await GetJsonAsync(client, $"api/sources/{PersistedSource}/replay"))
+            {
+                Assert.True(replay.RootElement.GetProperty("persisted").GetBoolean(), "persisted source must report persisted: true");
+                Assert.Equal(1, replay.RootElement.GetProperty("firstSeq").GetInt64());
+                Assert.Equal(RowCount, replay.RootElement.GetProperty("lastSeq").GetInt64());
+            }
+
+            using (var replay = await GetJsonAsync(client, $"api/sources/{PlainSource}/replay"))
+            {
+                Assert.False(replay.RootElement.GetProperty("persisted").GetBoolean(), "plain source must report persisted: false");
+            }
         }
     }
 
