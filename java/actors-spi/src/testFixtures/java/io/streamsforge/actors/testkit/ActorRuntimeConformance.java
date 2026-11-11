@@ -563,8 +563,11 @@ public abstract class ActorRuntimeConformance {
         release.complete(null);
         assertEquals(Integer.valueOf(1), get(first));
         awaitTrue("all 100 tells ran", () -> executed.get() == 100);
-        assertEquals(2, ev.stream().filter(e -> e.startsWith("activate:")).count(), "forwarded to a fresh activation");
-        assertTrue(ev.stream().anyMatch(e -> e.startsWith("deactivate:")));
+        // Where the 100 tells ran is runtime-specific (before onDeactivate on a runtime that drains already-delivered
+        // messages first, or on a fresh activation on one that forwards them); what is common is that none is lost
+        // and that deactivateOnIdle really deactivates.
+        awaitTrue("deactivated", () -> ev.stream().anyMatch(e -> e.startsWith("deactivate:")));
+        awaitTrue("collected", () -> !rt.activeKeys().contains(ref.key()) || ev.stream().filter(e -> e.startsWith("activate:")).count() == 2);
     }
 
     // ------------------------------------------------------------------ timers
