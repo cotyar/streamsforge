@@ -13,7 +13,7 @@ accumulated output must be identical row for row at every epoch. It also holds o
 a recursive one (`Reachability`).
 
 ```
-cd java && ./gradlew :engine-dd:test            # 157 tests, 6 skipped (the @Disabled bug repros), 0 failed
+cd java && ./gradlew :engine-dd:test            # 171 tests, 0 skipped, 0 failed
 ```
 
 ## Usage
@@ -109,18 +109,16 @@ equality), `WorkingRow.combine`. **Independent**: every join / outer-join paddin
 
 ## Discrepancies found and verdicts
 
-Result of running the above: **after one dialect alignment (1) the two sides agree on every in-order case; every remaining
-disagreement is a defect of the engine** (the dataflow side is order-insensitive Z-set algebra by construction). Repros are
-`@Disabled` tests in `EngineIssuesTest` that assert the *correct* answer; run them with
-`./gradlew :engine-dd:test -Djunit.jupiter.conditions.deactivate='org.junit.*DisabledCondition'` to see them fail (3 still
-open: findings 1 and 3; finding 2 is fixed and its repros run as ordinary tests).
+Result of running the above: **every disagreement was a defect of the engine** (the dataflow side is order-insensitive
+Z-set algebra by construction), and **all three are fixed** in the C# engine and the Java port (2026-11-11). Their repros
+in `EngineIssuesTest` assert the correct (PostgreSQL) answer and run as ordinary tests.
 
-1. **`SUM` over a group whose argument is NULL in every row returns `0`; ANSI SQL says NULL. Engine wrong (dialect
-   deviation, internally inconsistent).** The engine's `AVG`/`MIN`/`MAX` (and `VAR_SAMP`, whose doc says "undefined, not
-   zero") return NULL for the same group; only `SumZAggregator` returns `0`. Found as the first mismatch of the
-   differential run (the dataflow side followed ANSI). `DataflowTableCompiler.Options(sqlStandardEmptySum)` selects either;
-   the default matches the engine so the suites can compare. Repro: `engineSumOfOnlyNullsIsNull` (disabled); current
-   behaviour pinned by `engineSumOfNothingIsZeroWhileAvgMinAreNull_pinsCurrentBehaviour`.
+1. **FIXED 2026-11-11.** `SUM` over a group whose argument is NULL in every row returned `0`; PostgreSQL and ANSI SQL say
+   NULL, and the engine's own `AVG`/`MIN`/`MAX` (and `VAR_SAMP`, "undefined, not zero") already returned NULL for the
+   same group. Found as the first mismatch of the differential run. Both engines' SUM aggregators (pipeline and table
+   mode) now count non-NULL contributions and return NULL at zero. `DataflowTableCompiler.Options.ENGINE_COMPATIBLE`
+   (the default) is now the NULL answer; `Options.LEGACY_ZERO_SUM` reproduces the old one. Repros:
+   `engineSumOfOnlyNullsIsNull`, `engineAndDataflowAgree_sumOfNothingIsNullLikeAvgMin`.
 2. **FIXED 2026-11-11 in both the C# engine and this port** (`TableReduceOp` drops a zero-weight group only when every
    aggregator reports `IsEmpty`; MIN/MAX, COUNT(DISTINCT) and the quantile multiset keep signed counts; regression tests
    `TableReduceOrderInsensitivityTests` in both test suites). Original finding: **GROUP BY value aggregates are not
@@ -134,12 +132,16 @@ open: findings 1 and 3; finding 2 is fixed and its repros run as ordinary tests)
    engine's own `unmatchedRetractions` counter and the doc comment on the negative-total case show the authors know
    retractions can arrive first. The parameterized `engineValueAggregatesAreOrderInsensitiveWithinAnEpoch` is the
    differential form: 15 queries failed before the fix and pass after it.
-3. **`x NOT IN (subquery)` and NULL (ANSI deviation shared by engine and dataflow compiler).** ANSI: a NULL in the subquery
-   makes `NOT IN` UNKNOWN for every non-matching x (no rows); `NULL NOT IN (empty set)` is TRUE. `TableSemiAntiOp`
-   ignores NULL right keys ("the NOT IN NULL rule" in its comment) and drops every NULL left key even for an empty
-   subquery. The compiler copies the engine so the two agree (`notInWithNullInSubquery_pinsCurrentBehaviour`); the ANSI
-   answers are the disabled repros `notInWithNullInSubqueryReturnsNothing`, `nullNotInEmptySubqueryIsTrue`. Verdict: engine
-   deviates from ANSI; whether that is a deliberate dialect choice is not documented.
+3. **FIXED 2026-11-11.** `x NOT IN (subquery)` and NULL: `TableSemiAntiOp` ignored NULL right keys (plan 004's "NOT IN
+   NULL rule") and dropped every NULL left key even for an empty subquery, and the compiler copied that so the two agreed.
+   Now both follow PostgreSQL: TRUE for an empty subquery (even for a NULL x), FALSE on a match, otherwise NULL (filtered)
+   when x is NULL or the subquery yields a NULL. The engine op tracks NULL-keyed rows on both sides plus a count of present
+   right keys, and flips every affected row when the subquery gains or loses its first NULL or becomes empty; the
+   compiler expresses the same thing relationally (antijoin, then antijoin against one-key "S has a NULL" / "S is
+   non-empty" flag collections). Since the random inputs carry NULL `sym` values, the `not-in-subquery` /
+   `in-and-not-in` differential cases (in order and shuffled) now check the two implementations against each other on
+   these semantics. Repros: `notInWithNullInSubqueryReturnsNothing`, `nullNotInEmptySubqueryIsTrue`,
+   `engineAndDataflowAgree_notInWithNullInSubquery`.
 4. Not discrepancies, noted while writing queries: the dialect has no `IS NULL`, no `SELECT DISTINCT`; a CTE body cannot
    be a set operation (use `FROM (SELECT .. UNION .. SELECT ..) alias`); canonical row identity does not distinguish
    `0` from `0.0` (`Invariant.toString`), so the SUM result type being history-dependent (sticky `sawDouble`) is not visible

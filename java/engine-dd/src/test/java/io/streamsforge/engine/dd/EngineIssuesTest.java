@@ -8,13 +8,12 @@ import io.streamsforge.engine.SqlCompiler;
 import io.streamsforge.engine.TableDelta;
 import io.streamsforge.engine.TableExecutor;
 import java.util.Map;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 /**
  * Minimal repros of the engine deviations the differential tests found (see README "Discrepancies"). Each repro runs
  * the SAME input against the engine and against the dataflow compiler; the engine is the side that is wrong.
- * Disabled repros assert the CORRECT answer, so they go green when the engine is fixed.
+ * Repros assert the CORRECT answer (PostgreSQL's); all three deviations found so far are fixed (2026-11-11).
  */
 class EngineIssuesTest {
     static EventRecord trade(long ts, String sym, Double px, Long qty) {
@@ -95,28 +94,27 @@ class EngineIssuesTest {
     static final String SUM_NULLS = "SELECT sym, SUM(qty) AS s, AVG(qty) AS a, MIN(qty) AS mn, COUNT(qty) AS c FROM trades GROUP BY sym";
 
     @Test
-    void engineSumOfNothingIsZeroWhileAvgMinAreNull_pinsCurrentBehaviour() {
+    // Fixed 2026-11-11: SUM follows PostgreSQL — NULL over a group with no non-NULL value. Was a pin of SUM = 0.
+    void engineAndDataflowAgree_sumOfNothingIsNullLikeAvgMin() {
         var e = engine(SUM_NULLS);
         e.onTableDelta("trades", new TableDelta(trade(0, "A", 1.0, null), 1));
-        assertEquals(0L, only(e.snapshot(), "s"));
+        assertNull(only(e.snapshot(), "s"));
         assertNull(only(e.snapshot(), "a"));
         assertNull(only(e.snapshot(), "mn"));
         assertEquals(0L, only(e.snapshot(), "c"));
 
-        // The dataflow compiler matches by default and follows ANSI SQL under Options(sqlStandardEmptySum=true).
         var q = dd(SUM_NULLS);
         q.update("trades", trade(0, "A", 1.0, null), 1);
         q.commit();
-        assertEquals(0L, only(q.snapshot(), "s"));
-        var std = dd(SUM_NULLS, new DataflowTableCompiler.Options(true));
-        std.update("trades", trade(0, "A", 1.0, null), 1);
-        std.commit();
-        assertNull(only(std.snapshot(), "s"));
+        assertNull(only(q.snapshot(), "s"));
+        var legacy = dd(SUM_NULLS, DataflowTableCompiler.Options.LEGACY_ZERO_SUM);
+        legacy.update("trades", trade(0, "A", 1.0, null), 1);
+        legacy.commit();
+        assertEquals(0L, only(legacy.snapshot(), "s"));
     }
 
     @Test
-    @Disabled("bug (ANSI deviation): SUM over a group whose argument is NULL in every row returns 0; ANSI SQL returns NULL, and the "
-        + "engine's own AVG/MIN/MAX/VAR_SAMP return NULL for the same group (docs: 'undefined, not zero').")
+    // Fixed 2026-11-11 (was @Disabled).
     void engineSumOfOnlyNullsIsNull() {
         var e = engine(SUM_NULLS);
         e.onTableDelta("trades", new TableDelta(trade(0, "A", 1.0, null), 1));
@@ -138,23 +136,29 @@ class EngineIssuesTest {
     static final String NOT_IN = "SELECT sym, qty FROM trades WHERE sym NOT IN (SELECT sym FROM ref)";
 
     @Test
-    void notInWithNullInSubquery_pinsCurrentBehaviour() {
-        // engine and dataflow agree: NULLs in the subquery are ignored by NOT IN.
+    // Fixed 2026-11-11: PostgreSQL three-valued NOT IN in both. Was a pin of "NULLs in the subquery are ignored".
+    void engineAndDataflowAgree_notInWithNullInSubquery() {
         var e = engine(NOT_IN);
         var q = dd(NOT_IN);
-        for (var d : new Object[][] {{"ref", ref(null)}, {"ref", ref("B")}, {"trades", trade(0, "A", 1.0, 1L)}, {"trades", trade(0, "B", 1.0, 1L)}}) {
+        for (var d : new Object[][] {{"ref", ref(null)}, {"ref", ref("B")}, {"trades", trade(0, "A", 1.0, 1L)}, {"trades", trade(0, "B", 1.0, 1L)},
+                                     {"trades", trade(0, null, 1.0, 1L)}}) {
             e.onTableDelta((String) d[0], new TableDelta((EventRecord) d[1], 1));
             q.update((String) d[0], (EventRecord) d[1], 1);
         }
+        q.commit();
+        assertEquals(0, e.snapshot().size());
+        assertEquals(e.snapshot().keySet(), q.snapshot().keySet());
+
+        // Retracting the NULL brings A back (B still matches; the NULL-sym trade stays out: S is non-empty).
+        e.onTableDelta("ref", new TableDelta(ref(null), -1));
+        q.update("ref", ref(null), -1);
         q.commit();
         assertEquals(1, e.snapshot().size());
         assertEquals(e.snapshot().keySet(), q.snapshot().keySet());
     }
 
     @Test
-    @Disabled("bug (ANSI deviation, shared by engine and dataflow compiler): `x NOT IN (subquery)` where the subquery yields a NULL "
-        + "must be UNKNOWN for every x not matched by a non-NULL element, i.e. return no rows (ANSI SQL). The engine's TableSemiAntiOp "
-        + "ignores NULL right keys, so row A is returned.")
+    // Fixed 2026-11-11 (was @Disabled): `x NOT IN (S)` with a NULL in S is NULL for every unmatched x.
     void notInWithNullInSubqueryReturnsNothing() {
         var e = engine(NOT_IN);
         e.onTableDelta("ref", new TableDelta(ref(null), 1));
@@ -164,11 +168,15 @@ class EngineIssuesTest {
     }
 
     @Test
-    @Disabled("bug (ANSI deviation, shared by engine and dataflow compiler): `NULL NOT IN (empty subquery)` is TRUE in ANSI SQL so a "
-        + "trade with a NULL sym must be returned while ref is empty; TableSemiAntiOp drops every row with a NULL left key.")
+    // Fixed 2026-11-11 (was @Disabled): `NULL NOT IN (empty)` is TRUE.
     void nullNotInEmptySubqueryIsTrue() {
         var e = engine(NOT_IN);
         e.onTableDelta("trades", new TableDelta(trade(0, null, 1.0, 1L), 1));
         assertEquals(1, e.snapshot().size());
+
+        var q = dd(NOT_IN);
+        q.update("trades", trade(0, null, 1.0, 1L), 1);
+        q.commit();
+        assertEquals(e.snapshot().keySet(), q.snapshot().keySet());
     }
 }

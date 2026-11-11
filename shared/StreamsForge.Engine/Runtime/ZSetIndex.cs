@@ -7,6 +7,9 @@ internal sealed class ZSetIndex
 {
     private readonly Dictionary<string, Dictionary<string, (WorkingRow Row, long Weight)>> _byKey = [];
 
+    /// <summary>Every key that has ever held a row (a bucket may since have netted to empty).</summary>
+    public IEnumerable<string> Keys => _byKey.Keys;
+
     public IEnumerable<(WorkingRow Row, long Weight)> Lookup(string key)
     {
         if (!_byKey.TryGetValue(key, out var bucket)) yield break;

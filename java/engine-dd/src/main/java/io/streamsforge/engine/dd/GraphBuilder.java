@@ -166,8 +166,14 @@ final class GraphBuilder {
                 var right = sourceWr(j.alias, j.sourceName, j.derivedPlan);
                 var kl = keyed(left, w -> key1(j.leftKey, w, bindings));
                 Collection<String, LongTime> keys = right.map(w -> key1(j.rightKey, w, bindings)).filter(k -> k != null);
-                var res = j.kind == JoinKind.SEMI ? kl.semijoin(keys.distinct()) : kl.antijoin(keys);
-                return res.map(Pair::second);
+                if (j.kind == JoinKind.SEMI) return kl.semijoin(keys.distinct()).map(Pair::second); // NULLs never match
+                // PostgreSQL NOT IN, relationally: a non-NULL x passes when absent from S AND S holds no NULL; a NULL
+                // x passes only while S is empty. Both global conditions are a one-key ("") flag collection.
+                Collection<String, LongTime> sHasNull = right.filter(w -> key1(j.rightKey, w, bindings) == null).map(w -> "").distinct();
+                Collection<String, LongTime> sNonEmpty = right.map(w -> "").distinct();
+                var keyedPass = Keyed.of(kl.antijoin(keys).map(pr -> Pair.of("", pr.second()))).antijoin(sHasNull);
+                var nullPass = Keyed.of(left.filter(w -> key1(j.leftKey, w, bindings) == null).map(w -> Pair.of("", w))).antijoin(sNonEmpty);
+                return keyedPass.concat(nullPass).map(Pair::second);
             }
             case INNER:
             case CROSS: {

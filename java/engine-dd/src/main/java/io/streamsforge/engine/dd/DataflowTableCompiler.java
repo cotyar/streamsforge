@@ -31,12 +31,15 @@ public final class DataflowTableCompiler {
     }
 
     /**
-     * Dialect knobs. {@code sqlStandardEmptySum}: SUM over a group whose argument is NULL in every row is NULL in ANSI
-     * SQL (and AVG/MIN/MAX of the same group are NULL in this engine), but the engine's SUM returns 0 there. Default
-     * {@code false} = match the engine (so the two can be compared row for row); see README "Discrepancies".
+     * Dialect knobs. {@code sqlStandardEmptySum}: SUM over a group whose argument is NULL in every row is NULL in
+     * PostgreSQL / ANSI SQL, which is what the engine does too since 2026-11-11; {@code false} reproduces the
+     * engine's earlier dialect (0). {@link #ENGINE_COMPATIBLE} (the default) matches the engine, so the two can be
+     * compared row for row; see README "Discrepancies".
      */
     public record Options(boolean sqlStandardEmptySum) {
-        public static final Options ENGINE_COMPATIBLE = new Options(false);
+        public static final Options ENGINE_COMPATIBLE = new Options(true);
+        /** SUM over no non-NULL value is 0 — the engine's behaviour before 2026-11-11. */
+        public static final Options LEGACY_ZERO_SUM = new Options(false);
     }
 
     public static Outcome compile(String sql, Map<String, SourceSchema> streamSchemas, Map<String, SourceSchema> tableSchemas) {

@@ -45,10 +45,13 @@ FROM source | (SELECT …) alias [, UNNEST(expr) AS l …]
 
 ## Gotchas that will bite you (all tested, all deliberate)
 
-1. **`SUM(l ->> 'x')` returns 0** — `->>` is always text; aggregate the raw node: `SUM(l -> 'x')`.
+1. **`SUM(l ->> 'x')` returns NULL** — `->>` is always text, which SUM skips; aggregate the raw node:
+   `SUM(l -> 'x')`. (SUM over no non-NULL value is NULL, as in PostgreSQL; COUNT(x) is 0.)
 2. **Pipeline-mode subqueries must be windowed** (IN/EXISTS/scalar): value = rolling snapshot
    replaced at each inner window close. Tables have no such restriction.
-3. **`NOT IN` ignores subquery NULLs** (documented deviation from 3-valued SQL).
+3. **`NOT IN` is PostgreSQL's three-valued NOT IN**: one NULL in the subquery filters every row that
+   did not match; `NULL NOT IN (empty)` is true. Use `NOT EXISTS` or filter the subquery's NULLs if
+   that is not what you want.
 4. **`LATEST BY`**: older-`_ts` arrivals ignored; upstream retraction drops the key (no fallback
    to prior versions — use row history for trails). Mutually exclusive with GROUP BY/aggregates.
 5. **UNNEST**: element binds as a JSON value — address with `l ->> 'field'`, never `l.field`

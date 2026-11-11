@@ -52,7 +52,7 @@ final class Aggs {
                     if (v instanceof Long l) { ls += l * w.weight(); ds += (double) (l * w.weight()); any = true; }
                     else if (v instanceof Double d) { ds += d * w.weight(); sawDouble = true; any = true; }
                 }
-                if (!any) return sqlStandardEmptySum ? null : (Object) 0L; // ANSI SQL: NULL; the engine's dialect: 0
+                if (!any) return sqlStandardEmptySum ? null : (Object) 0L; // PostgreSQL/ANSI: NULL (the engine since 2026-11-11); legacy: 0
                 return sawDouble ? (Object) ds : (Object) ls;
             }
             case "AVG": {

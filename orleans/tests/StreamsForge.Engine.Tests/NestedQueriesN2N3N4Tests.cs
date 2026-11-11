@@ -228,10 +228,11 @@ public class NestedQueriesN2N3N4Tests
     }
 
     [Fact]
-    public void NotInNullRuleIgnoresNullSubqueryValues()
+    public void NotInWithANullInTheSubqueryFiltersNonMatchingRows()
     {
-        // Plan 004 deviation from strict three-valued SQL: NULLs in the subquery result are ignored, so
-        // `MSFT NOT IN ('AAPL', NULL)` passes here (strict SQL would make it NULL/filtered).
+        // PostgreSQL three-valued logic: `'MSFT' NOT IN ('AAPL', NULL)` is NULL, so the row is filtered.
+        // (Changed 2026-11-11 at the user's request: this test used to pin plan 004's deviation, which
+        // ignored NULLs in the subquery and let MSFT through. See PostgresNullSemanticsTests.)
         var sql = "SELECT symbol FROM trades WHERE symbol NOT IN (SELECT symbol FROM ref)";
         var exec = CompileTableAndCreate(sql, [Trades], [Ref]);
 
@@ -239,9 +240,7 @@ public class NestedQueriesN2N3N4Tests
         exec.OnTableDelta("ref", new TableDelta(Evt(0, "ref", ("symbol", null), ("tag", "y")), 1));
 
         var result = exec.OnStreamEvent("trades", Evt(1000, "trades", ("symbol", "MSFT"), ("price", 50.0), ("qty", 1L), ("active", true)));
-        var row = Assert.Single(result);
-        Assert.Equal(1, row.Weight);
-        Assert.Equal("MSFT", row.Row["symbol"]);
+        Assert.Empty(result);
     }
 
     [Fact]

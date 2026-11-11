@@ -20,11 +20,19 @@ namespace StreamsForge.Engine.Runtime.Ops;
 /// Planner.BuildSemiAntiJoin), collapsing every row on both sides into one global bucket — "is there any B
 /// row at all" becomes "is the constant key present", the exact same presence test IN uses per-key.
 ///
-/// NOT IN NULL rule (plan 004, deliberate deviation from strict three-valued SQL): a B-side row whose key
-/// expression evaluates to NULL is never indexed at all — see <see cref="OnRightBatch"/> — so it can never
-/// make a key "present" and never poisons NOT IN into "always false" the way strict SQL's NULL-in-subquery
-/// trap would. An A-side row whose OWN key is NULL is dropped outright (never indexed, never emitted) —
-/// ordinary WHERE null-handling (IsTrue(null) == false) applies there, unrelated to the NOT IN NULL rule.
+/// NULL semantics follow PostgreSQL's three-valued logic (a WHERE conjunct keeps a row only when TRUE):
+/// <list type="bullet">
+/// <item>IN (Semi): <c>x IN (S)</c> is TRUE only on a match; a NULL in S or a NULL x can only make it
+/// NULL, never TRUE, so NULL-keyed rows on either side simply never pass.</item>
+/// <item>NOT IN (Anti): <c>x NOT IN (S)</c> is TRUE when S is empty (even for a NULL x); otherwise FALSE
+/// on a match and NULL (filtered) when x is NULL or S contains a NULL. So one NULL in the subquery result
+/// filters every outer row that did not match, and its retraction brings them back.</item>
+/// </list>
+/// To flip those rows incrementally, NULL-keyed rows are tracked on both sides (<see cref="LeftNulls"/>,
+/// <see cref="RightNulls"/>) and the number of present non-NULL B keys is counted, so "S is empty" and "S
+/// contains a NULL" are O(1). (Before 2026-11-11 this op ignored NULLs in S — a deliberate plan 004
+/// deviation that made <c>'MSFT' NOT IN ('AAPL', NULL)</c> pass.) The B side reaches every partition by
+/// Broadcast, so each partition's copy of this global state is complete.
 ///
 /// STATE: <see cref="Left"/> (A-side rows, keyed by their evaluated LeftKey — used to find "which A rows
 /// need re-emitting" when a B-side key's presence flips) and <see cref="Right"/> (B-side rows, keyed by
@@ -46,20 +54,42 @@ internal sealed class TableSemiAntiOp(JoinKind kind, Expr leftKey, Expr rightKey
     /// itself is never read back out.</summary>
     public ZSetIndex Right { get; } = new();
 
+    /// <summary>A-side rows whose key is NULL (single bucket). Only Anti needs them: they pass exactly
+    /// while the B side is empty.</summary>
+    public ZSetIndex LeftNulls { get; } = new();
+
+    /// <summary>B-side rows whose key is NULL (single bucket) — for Anti, "S contains a NULL".</summary>
+    public ZSetIndex RightNulls { get; } = new();
+
+    private const string NullBucket = "";
+    private int _presentRightKeys;
+
+    private bool RightHasNull => RightNulls.Lookup(NullBucket).Any();
+    private bool RightIsEmpty => _presentRightKeys == 0 && !RightHasNull;
+
+    private bool PassesKeyed(bool present, bool rightHasNull) => _isAnti ? !present && !rightHasNull : present;
+    private bool PassesNullKey(bool rightIsEmpty) => _isAnti && rightIsEmpty;
+
     public IReadOnlyList<TableRowDelta> OnLeftBatch(Epoch epoch, IReadOnlyList<TableRowDelta> input)
     {
         var results = new List<TableRowDelta>();
         foreach (var d in input)
         {
             var keyVal = ExpressionEvaluator.Eval(leftKey, new EvalContext(d.Row, bindings));
-            if (keyVal is null) continue; // outer key NULL: unknown membership, WHERE-null semantics (dropped)
-
-            var keyStr = TableKeyEncoding.EncodeScalar(keyVal);
             var rowCanonical = JsonText.SerializeCanonicalRow(d.Row.Fields);
-            Left.Apply(keyStr, rowCanonical, d.Row, d.Weight);
-
-            bool present = Right.Lookup(keyStr).Any();
-            bool passes = present != _isAnti; // Semi: passes when present; Anti: passes when absent
+            bool passes;
+            if (keyVal is null)
+            {
+                if (!_isAnti) continue; // NULL IN (...) is never TRUE: nothing to remember
+                LeftNulls.Apply(NullBucket, rowCanonical, d.Row, d.Weight);
+                passes = PassesNullKey(RightIsEmpty);
+            }
+            else
+            {
+                var keyStr = TableKeyEncoding.EncodeScalar(keyVal);
+                Left.Apply(keyStr, rowCanonical, d.Row, d.Weight);
+                passes = PassesKeyed(Right.Lookup(keyStr).Any(), RightHasNull);
+            }
             if (passes) results.Add(new TableRowDelta(d.Row, d.Weight));
         }
         return results;
@@ -71,27 +101,51 @@ internal sealed class TableSemiAntiOp(JoinKind kind, Expr leftKey, Expr rightKey
         foreach (var d in input)
         {
             var keyVal = ExpressionEvaluator.Eval(rightKey, new EvalContext(d.Row, bindings));
-            if (keyVal is null) continue; // NOT IN NULL rule: NULLs in the subquery result are ignored
-
-            var keyStr = TableKeyEncoding.EncodeScalar(keyVal);
-            bool wasPresent = Right.Lookup(keyStr).Any();
-
             var rowCanonical = JsonText.SerializeCanonicalRow(d.Row.Fields);
-            Right.Apply(keyStr, rowCanonical, d.Row, d.Weight);
+            bool hadNull = RightHasNull, wasEmpty = RightIsEmpty;
 
-            bool isPresentNow = Right.Lookup(keyStr).Any();
-            if (wasPresent == isPresentNow) continue; // presence didn't flip: B changed, but no A row is affected
-
-            // Presence flipped: re-emit every currently-indexed A-row under this key. Semi: newly-present
-            // means assert (their weight), newly-absent means retract (negate their weight). Anti mirrors.
-            bool nowPasses = isPresentNow != _isAnti;
-            int sign = nowPasses ? 1 : -1;
-            foreach (var (aRow, aWeight) in Left.Lookup(keyStr))
+            if (keyVal is null)
             {
-                results.Add(new TableRowDelta(aRow, sign * aWeight));
+                if (!_isAnti) continue; // a NULL in S never makes IN TRUE
+                RightNulls.Apply(NullBucket, rowCanonical, d.Row, d.Weight);
+                if (RightHasNull != hadNull)
+                {
+                    // Every keyed A-row whose key is absent from S flips at once.
+                    foreach (var k in Left.Keys)
+                    {
+                        bool present = Right.Lookup(k).Any();
+                        EmitFlip(results, Left.Lookup(k), PassesKeyed(present, hadNull), PassesKeyed(present, !hadNull));
+                    }
+                }
+            }
+            else
+            {
+                var keyStr = TableKeyEncoding.EncodeScalar(keyVal);
+                bool wasPresent = Right.Lookup(keyStr).Any();
+                Right.Apply(keyStr, rowCanonical, d.Row, d.Weight);
+                bool isPresentNow = Right.Lookup(keyStr).Any();
+                if (wasPresent != isPresentNow)
+                {
+                    _presentRightKeys += isPresentNow ? 1 : -1;
+                    EmitFlip(results, Left.Lookup(keyStr), PassesKeyed(wasPresent, hadNull), PassesKeyed(isPresentNow, hadNull));
+                }
+            }
+
+            if (_isAnti && RightIsEmpty != wasEmpty)
+            {
+                EmitFlip(results, LeftNulls.Lookup(NullBucket), PassesNullKey(wasEmpty), PassesNullKey(!wasEmpty));
             }
         }
         return results;
+    }
+
+    /// <summary>Re-emits <paramref name="rows"/> when their pass/fail verdict flipped: +weight when they now
+    /// pass, −weight when they no longer do.</summary>
+    private static void EmitFlip(List<TableRowDelta> results, IEnumerable<(WorkingRow Row, long Weight)> rows, bool passedBefore, bool passesNow)
+    {
+        if (passedBefore == passesNow) return;
+        int sign = passesNow ? 1 : -1;
+        foreach (var (row, weight) in rows) results.Add(new TableRowDelta(row, sign * weight));
     }
 
     /// <summary>Pass-through — see TableJoinOp's identical OnFrontier doc: table mode has no epoch-driven

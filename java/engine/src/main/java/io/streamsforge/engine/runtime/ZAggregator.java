@@ -50,16 +50,18 @@ final class SumZAggregator implements IZAggregator {
     private double sum;
     private long longSum;
     private boolean sawDouble;
+    private long count; // weighted count of non-NULL contributions
 
     @Override public void apply(Object value, long weight) {
-        if (value instanceof Double d) { sum += d * weight; sawDouble = true; }
-        else if (value instanceof Long l) { sum += (double) (l * weight); longSum += l * weight; }
+        if (value instanceof Double d) { sum += d * weight; sawDouble = true; count += weight; }
+        else if (value instanceof Long l) { sum += (double) (l * weight); longSum += l * weight; count += weight; }
     }
 
-    @Override public Object result() { return sawDouble ? (Object) sum : (Object) longSum; }
+    // PostgreSQL: SUM over no non-NULL value (an all-NULL group) is NULL, not 0 — like AVG/MIN/MAX.
+    @Override public Object result() { return count == 0 ? null : sawDouble ? (Object) sum : (Object) longSum; }
 
-    // Linear: zero sums answer like a fresh accumulator for every future contribution.
-    @Override public boolean isEmpty() { return sum == 0 && longSum == 0; }
+    // Linear: zero sums and count answer like a fresh accumulator for every future contribution.
+    @Override public boolean isEmpty() { return sum == 0 && longSum == 0 && count == 0; }
 }
 
 final class AvgZAggregator implements IZAggregator {

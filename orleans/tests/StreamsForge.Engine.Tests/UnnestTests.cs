@@ -217,7 +217,8 @@ public class UnnestTests
         // Documents the pinned coercion rule: '->>' always returns TEXT (see JsonAccessExpr.ReturnText),
         // and SumAggregator/AvgAggregator only recognize `long`/`double` inputs (see Aggregators.cs) — a
         // TEXT value silently contributes nothing. Use '->' for numeric aggregation instead (see the
-        // acceptance test above).
+        // acceptance test above). With nothing numeric contributed, SUM is NULL (PostgreSQL's SUM over no
+        // values; this asserted 0 before 2026-11-11, when SUM was aligned with PostgreSQL at the user's request).
         var sql = "SELECT l ->> 'ccy' AS ccy, SUM(l ->> 'notional') AS total_notional " +
                   "FROM structures s, UNNEST(s.legs) AS l " +
                   "GROUP BY l ->> 'ccy' " +
@@ -229,7 +230,7 @@ public class UnnestTests
         var results = exec.AdvanceWatermark(10_000);
 
         var row = Assert.Single(results, r => (string)r["ccy"]! == "USD");
-        Assert.Equal(0L, row["total_notional"]); // NOT 100 — the documented '->>' aggregation trap
+        Assert.Null(row["total_notional"]); // NOT 100 — the documented '->>' aggregation trap
     }
 
     // ------------------------------------------------------------------

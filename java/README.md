@@ -21,14 +21,17 @@ cd java && ./gradlew build          # everything, ~1 min
 
 ## Engine bugs found by `engine-dd` (present in the C# original too)
 
-Details in [engine-dd/README.md](engine-dd/README.md); open ones have `@Disabled` repros in `EngineIssuesTest`.
+Details in [engine-dd/README.md](engine-dd/README.md); repros in `EngineIssuesTest`. All three are fixed.
 
 1. **Fixed (C# and Java, 2026-11-11):** table-mode GROUP BY value aggregates (SUM/MIN/MAX/AVG/COUNT(x)/
    COUNT DISTINCT/quantiles) were order-sensitive when a retraction arrived before its assertion —
    `TableReduceOp` dropped a group at total weight exactly 0, and the multiset aggregates ignored a retraction
    of a value they had not seen. Regression tests: `TableReduceOrderInsensitivityTests` in both engines.
-2. **Open:** `SUM` over an all-NULL group yields 0, while AVG/MIN/MAX yield NULL.
-3. **Open:** `NOT IN` with NULLs is not ANSI (undocumented; possibly intended).
+2. **Fixed (C# and Java, 2026-11-11):** `SUM` over a group with no non-NULL value yielded 0 (AVG/MIN/MAX: NULL);
+   it is NULL now, as in PostgreSQL.
+3. **Fixed (C# and Java, 2026-11-11):** `NOT IN` ignored NULLs in the subquery and dropped NULL operands; it is
+   PostgreSQL's three-valued `NOT IN` now (a NULL in the subquery filters every unmatched row; `NULL NOT IN (empty)`
+   is true). Regression tests for 2 and 3: `PostgresNullSemanticsTests` in both engines.
 
 ## What it is not
 

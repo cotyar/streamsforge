@@ -63,8 +63,9 @@ internal sealed class SumAggregator : Aggregator
         }
     }
 
-    // Branches are boxed explicitly to avoid C# unifying long/double arms to double before boxing.
-    public override object? Result => !_any ? (object)0L : _sawDouble ? (object)_sum : (object)_longSum;
+    // PostgreSQL: SUM over no non-NULL value is NULL, not 0. Branches are boxed explicitly to avoid C#
+    // unifying long/double arms to double before boxing.
+    public override object? Result => !_any ? null : _sawDouble ? (object)_sum : (object)_longSum;
 }
 
 internal sealed class AvgAggregator : Aggregator

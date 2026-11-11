@@ -206,7 +206,8 @@ class UnnestTests {
     void sumOfArrowArrowTextDoesNotAccumulateNumerically() {
         // Documents the pinned coercion rule: '->>' always returns TEXT, and SumAggregator/AvgAggregator only
         // recognize long/double inputs — a TEXT value silently contributes nothing. Use '->' for numeric
-        // aggregation instead (see the acceptance test above).
+        // aggregation instead (see the acceptance test above). With nothing numeric contributed, SUM is NULL
+        // (PostgreSQL; this asserted 0 before 2026-11-11, when SUM was aligned with PostgreSQL at the user's request).
         var sql = "SELECT l ->> 'ccy' AS ccy, SUM(l ->> 'notional') AS total_notional " +
                   "FROM structures s, UNNEST(s.legs) AS l " +
                   "GROUP BY l ->> 'ccy' " +
@@ -218,7 +219,7 @@ class UnnestTests {
         var results = exec.advanceWatermark(10_000);
 
         var row = single(results, r -> "USD".equals((String) r.get("ccy")));
-        assertEquals(0L, row.get("total_notional")); // NOT 100 — the documented '->>' aggregation trap
+        assertNull(row.get("total_notional")); // NOT 100 — the documented '->>' aggregation trap
     }
 
     // ------------------------------------------------------------------

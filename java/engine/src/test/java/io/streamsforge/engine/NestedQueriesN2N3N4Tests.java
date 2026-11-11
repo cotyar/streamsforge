@@ -211,9 +211,10 @@ class NestedQueriesN2N3N4Tests {
     }
 
     @Test
-    void notInNullRuleIgnoresNullSubqueryValues() {
-        // Plan 004 deviation from strict three-valued SQL: NULLs in the subquery result are ignored, so
-        // `MSFT NOT IN ('AAPL', NULL)` passes here (strict SQL would make it NULL/filtered).
+    void notInWithANullInTheSubqueryFiltersNonMatchingRows() {
+        // PostgreSQL three-valued logic: `'MSFT' NOT IN ('AAPL', NULL)` is NULL, so the row is filtered.
+        // (Changed 2026-11-11 at the user's request: this used to pin plan 004's deviation, which ignored NULLs
+        // in the subquery and let MSFT through. See PostgresNullSemanticsTests.)
         var sql = "SELECT symbol FROM trades WHERE symbol NOT IN (SELECT symbol FROM ref)";
         var exec = compileTableAndCreate(sql, new SourceSchema[] {TRADES}, new SourceSchema[] {REF});
 
@@ -221,9 +222,7 @@ class NestedQueriesN2N3N4Tests {
         exec.onTableDelta("ref", new TableDelta(evt(0, "ref", "symbol", null, "tag", "y"), 1));
 
         var result = exec.onStreamEvent("trades", evt(1000, "trades", "symbol", "MSFT", "price", 50.0, "qty", 1L, "active", true));
-        var row = single(result);
-        assertEquals(1L, row.weight());
-        assertEquals("MSFT", row.row().get("symbol"));
+        assertTrue(result.isEmpty());
     }
 
     @Test

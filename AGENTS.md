@@ -35,8 +35,9 @@ its own note on why `/docs` doesn't serve it automatically).
 library (`dataflow`), a faithful port of `StreamsForge.Engine` (`engine`, 801/801 in-scope C# cases),
 table SQL on that dataflow differential-tested against the engine (`engine-dd` — it found that table
 GROUP BY value aggregates were order-sensitive when a retraction precedes its assertion, in the C# engine
-too; fixed in both, `TableReduceOrderInsensitivityTests`. Two ANSI deviations it found — SUM over all-NULL
-is 0, NOT IN with NULL — are still open as `@Disabled` repros in `EngineIssuesTest`), an Orleans-grain-shaped actor SPI with three runtimes (`actors-futures`,
+too; fixed in both, `TableReduceOrderInsensitivityTests`. The two NULL deviations it found are fixed too —
+SUM over no non-NULL value is NULL and `NOT IN` is three-valued, both as in PostgreSQL, in both engines and
+in `engine-dd`'s compiler; `PostgresNullSemanticsTests`), an Orleans-grain-shaped actor SPI with three runtimes (`actors-futures`,
 `actors-loom` virtual threads, `actors-pekko`), and a mini host on that SPI (`host`). Overview:
 [`java/README.md`](java/README.md). Hard rule 1 applies there too: a ported test's expectation is never
 edited to make the port pass.
@@ -509,7 +510,8 @@ invocations with their own ports for `ts-consumer` (`bun run main.ts`) and `java
 5. **Field numbers are forever**: dynamic-protobuf numbering persists in the registry (Active +
    Reserved); both reflection and proto downloads must obtain numbers there, keyed canonically by
    entity **id** even when resolved by name.
-6. **SQL fine print**: aggregate JSON with `->` not `->>` (text sums to zero); pipeline-mode
+6. **SQL fine print**: aggregate JSON with `->` not `->>` (text is skipped, so the SUM is NULL); `NOT IN`
+   is PostgreSQL's three-valued one (a NULL in the subquery filters every unmatched row); pipeline-mode
    subqueries must be windowed; `LATEST BY` is table-mode only; `FROM <pipeline>` is table-mode only
    too — a table may read a pipeline by name (the pipeline's `OutputFields` is the relation, so source,
    pipeline and table names share ONE namespace and the create paths refuse a collision), while a

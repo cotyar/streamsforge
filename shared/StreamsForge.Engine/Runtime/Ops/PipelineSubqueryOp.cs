@@ -56,24 +56,35 @@ internal sealed class PipelineSubqueryOp : IPipelineSnapshotJoinStage
         _nullRight = WorkingRow.NullSide([rightSide]);
     }
 
+    /// <summary>Whether the current snapshot holds a row whose key is NULL — for NOT IN, PostgreSQL's
+    /// "S contains a NULL", which makes <c>x NOT IN (S)</c> NULL (filtered) for every x that did not match.</summary>
+    private bool _hasNull;
+
+    /// <summary>Whether the current snapshot holds any row at all (NULL-keyed included) — <c>x NOT IN (S)</c>
+    /// is TRUE for an empty S even when x is NULL.</summary>
+    private bool _nonEmpty;
+
     /// <summary>Replaces the whole snapshot from one inner-executor emission batch — see class doc. A
-    /// B-row whose key evaluates to NULL is skipped entirely: for Semi/Anti, this is the SAME "NOT IN NULL
-    /// rule" TableSemiAntiOp documents (a NULL subquery-result value is ignored, never poisoning
-    /// membership); for Scalar, a NULL correlation key can never legitimately match an outer row either.</summary>
+    /// B-row whose key evaluates to NULL is not indexed (it can never match), but it is remembered in
+    /// <see cref="_hasNull"/>: NOT IN follows the same PostgreSQL three-valued rule TableSemiAntiOp
+    /// documents. For Scalar, a NULL correlation key can never legitimately match an outer row.</summary>
     public void OnRightBatch(IReadOnlyList<WorkingRow> rows)
     {
         if (rows.Count == 0) return; // rolling: an empty batch leaves the prior snapshot live
 
         var next = new Dictionary<string, List<WorkingRow>>();
+        bool hasNull = false;
         foreach (var row in rows)
         {
             var keyVal = ExpressionEvaluator.Eval(_rightKey, new EvalContext(row, _bindings));
-            if (keyVal is null) continue;
+            if (keyVal is null) { hasNull = true; continue; }
             var keyStr = TableKeyEncoding.EncodeScalar(keyVal);
             if (!next.TryGetValue(keyStr, out var list)) { list = []; next[keyStr] = list; }
             list.Add(row);
         }
         _snapshot = next;
+        _hasNull = hasNull;
+        _nonEmpty = true; // rows.Count > 0 here
     }
 
     public List<WorkingRow> OnLeft(WorkingRow row)
@@ -81,11 +92,12 @@ internal sealed class PipelineSubqueryOp : IPipelineSnapshotJoinStage
         var keyVal = ExpressionEvaluator.Eval(_leftKey, new EvalContext(row, _bindings));
         if (keyVal is null)
         {
-            // Semi/Anti: outer key NULL — unknown membership, ordinary WHERE-null semantics (dropped).
+            // Semi: NULL IN (S) is never TRUE (dropped). Anti: NULL NOT IN (S) is TRUE only for an empty S.
             // Scalar: outer correlation key NULL — value is undefined, which IS a legitimate NULL scalar
             // result (not a row filter) — null-pad and keep the row, matching SQL's "scalar subquery with
             // no matching group evaluates to NULL" rule.
-            return _kind == JoinKind.Scalar ? [WorkingRow.Combine(row, _nullRight)] : [];
+            if (_kind == JoinKind.Scalar) return [WorkingRow.Combine(row, _nullRight)];
+            return _kind == JoinKind.Anti && !_nonEmpty ? [row] : [];
         }
 
         var keyStr = TableKeyEncoding.EncodeScalar(keyVal);
@@ -107,7 +119,8 @@ internal sealed class PipelineSubqueryOp : IPipelineSnapshotJoinStage
             return [WorkingRow.Combine(row, _nullRight)];
         }
 
-        bool passes = present != (_kind == JoinKind.Anti); // Semi: passes when present; Anti: passes when absent
+        // Semi: passes when present. Anti: passes when absent AND S holds no NULL (else the result is NULL).
+        bool passes = _kind == JoinKind.Anti ? !present && !_hasNull : present;
         return passes ? [row] : [];
     }
 

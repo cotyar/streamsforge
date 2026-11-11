@@ -45,27 +45,37 @@ public final class PipelineSubqueryOp implements IPipelineSnapshotJoinStage {
         this.nullRight = WorkingRow.nullSide(List.of(rightSide));
     }
 
+    /** Whether the snapshot holds a NULL-keyed row: PostgreSQL's "S contains a NULL" for NOT IN. */
+    private boolean hasNull;
+    /** Whether the snapshot holds any row at all: {@code x NOT IN (S)} is TRUE for an empty S, even for a NULL x. */
+    private boolean nonEmpty;
+
     /** Replaces the whole snapshot from one inner-executor emission batch. A B-row whose key evaluates to NULL
-     *  is skipped entirely. */
+     *  is not indexed (it never matches) but sets {@link #hasNull} — see TableSemiAntiOp's NULL rules. */
     @Override public void onRightBatch(List<WorkingRow> rows) {
         if (rows.isEmpty()) return; // rolling: an empty batch leaves the prior snapshot live
 
         var next = new HashMap<String, List<WorkingRow>>();
+        boolean sawNull = false;
         for (var row : rows) {
             var keyVal = ExpressionEvaluator.eval(rightKey, new EvalContext(row, bindings));
-            if (keyVal == null) continue;
+            if (keyVal == null) { sawNull = true; continue; }
             String keyStr = TableKeyEncoding.encodeScalar(keyVal);
             next.computeIfAbsent(keyStr, k -> new ArrayList<>()).add(row);
         }
         snapshot = next;
+        hasNull = sawNull;
+        nonEmpty = true;
     }
 
     @Override public List<WorkingRow> onLeft(WorkingRow row) {
         var keyVal = ExpressionEvaluator.eval(leftKey, new EvalContext(row, bindings));
         var result = new ArrayList<WorkingRow>();
         if (keyVal == null) {
-            // Semi/Anti: outer key NULL — dropped. Scalar: null-pad and keep the row.
+            // Scalar: null-pad and keep the row. Semi: NULL IN (S) is never TRUE. Anti: NULL NOT IN (S) is TRUE
+            // only for an empty S.
             if (kind == JoinKind.SCALAR) result.add(WorkingRow.combine(row, nullRight));
+            else if (kind == JoinKind.ANTI && !nonEmpty) result.add(row);
             return result;
         }
 
@@ -87,7 +97,8 @@ public final class PipelineSubqueryOp implements IPipelineSnapshotJoinStage {
             return result;
         }
 
-        boolean passes = present != (kind == JoinKind.ANTI); // Semi: passes when present; Anti: passes when absent
+        // Semi: passes when present. Anti: passes when absent AND S holds no NULL (else the result is NULL).
+        boolean passes = kind == JoinKind.ANTI ? !present && !hasNull : present;
         if (passes) result.add(row);
         return result;
     }

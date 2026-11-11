@@ -14,6 +14,9 @@ public final class ZSetIndex {
 
     private final Map<String, Map<String, Entry>> byKey = new HashMap<>();
 
+    /** Every key that has ever held a row (a bucket may since have netted to empty); a copy. */
+    public List<String> keys() { return new ArrayList<>(byKey.keySet()); }
+
     /** Snapshot of the bucket (so callers may mutate the index while iterating). */
     public List<Entry> lookup(String key) {
         var bucket = byKey.get(key);

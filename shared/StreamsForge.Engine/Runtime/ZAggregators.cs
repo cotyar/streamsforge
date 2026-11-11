@@ -67,21 +67,23 @@ internal sealed class SumZAggregator : IZAggregator
     private double _sum;
     private long _longSum;
     private bool _sawDouble;
+    private long _count; // weighted count of non-NULL contributions
 
     public void Apply(object? value, long weight)
     {
         switch (value)
         {
-            case double d: _sum += d * weight; _sawDouble = true; break;
-            case long l: _sum += l * weight; _longSum += l * weight; break;
+            case double d: _sum += d * weight; _sawDouble = true; _count += weight; break;
+            case long l: _sum += l * weight; _longSum += l * weight; _count += weight; break;
         }
     }
 
-    public object? Result => _sawDouble ? (object)_sum : (object)_longSum;
+    // PostgreSQL: SUM over no non-NULL value (an all-NULL group) is NULL, not 0 — like AVG/MIN/MAX.
+    public object? Result => _count == 0 ? null : _sawDouble ? (object)_sum : (object)_longSum;
 
-    // SUM is linear: a state whose sums are both zero answers exactly like a fresh one for every future
-    // contribution, whatever multiset produced it ({+5, −5} of two different rows included).
-    public bool IsEmpty => _sum == 0 && _longSum == 0;
+    // SUM is linear: a state whose sums and count are all zero answers exactly like a fresh one for every
+    // future contribution, whatever multiset produced it ({+5, −5} of two different rows included).
+    public bool IsEmpty => _sum == 0 && _longSum == 0 && _count == 0;
 }
 
 internal sealed class AvgZAggregator : IZAggregator

@@ -60,7 +60,8 @@ final class SumAggregator extends Aggregator {
         else if (value instanceof Long l) { sum += l; longSum += l; any = true; }
     }
 
-    @Override public Object result() { return !any ? (Object) 0L : sawDouble ? (Object) sum : (Object) longSum; }
+    // PostgreSQL: SUM over no non-NULL value is NULL, not 0.
+    @Override public Object result() { return !any ? null : sawDouble ? (Object) sum : (Object) longSum; }
 }
 
 final class AvgAggregator extends Aggregator {

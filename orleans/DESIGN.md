@@ -78,8 +78,11 @@ which call back into it needs this treatment — check the allowlist before addi
 Pinned, tested, and documented rather than fudged:
 - Pipeline-mode subqueries (membership/scalar) must be **windowed**; their value is a rolling
   snapshot replaced at inner window close.
-- `NOT IN` ignores subquery NULLs (documented deviation from three-valued SQL).
-- Aggregate JSON legs with `->` (raw node); `->>` is text and silently sums to zero.
+- `NOT IN` follows PostgreSQL's three-valued logic: TRUE for an empty subquery (even for a NULL
+  operand), FALSE on a match, otherwise NULL (filtered) when the operand is NULL or the subquery
+  yields a NULL — one NULL in the subquery filters every unmatched row. (Until 2026-11-11 it ignored
+  subquery NULLs, a plan 004 deviation.) `SUM` over no non-NULL value is NULL, as in PostgreSQL.
+- Aggregate JSON legs with `->` (raw node); `->>` is text, which aggregates skip, so the sum is NULL.
 - `LATEST BY` keeps one row per key (older-timestamp arrivals ignored; upstream retraction drops
   the key — no multiset fallback history; that's what row history is for).
 - Windows-in-windows: inner emissions carry the inner window's **end** timestamp.
