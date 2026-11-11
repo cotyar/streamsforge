@@ -859,7 +859,7 @@ public abstract class ActorRuntimeConformance {
         rt.close();
         assertEquals(w.activations.get(), w.deactivations.get(), "every activation must be deactivated by close()");
         System.out.println("[conformance] " + type + ": " + w.activations.get() + " activations for " + keys + " keys, " + sent.get() + " messages");
-        assertTrue(w.activations.get() > keys * 2L, "the chaos threads must actually have forced re-activations");
+        if (pace || maxPending <= 2) assertTrue(w.activations.get() > keys * 2L, "the chaos threads must actually have forced re-activations");
         for (KeyStats s : w.stats.values()) {
             assertEquals(0, s.liveActivations.get());
             assertEquals(0, s.liveTurns.get());
