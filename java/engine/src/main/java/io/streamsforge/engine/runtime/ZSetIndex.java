@@ -2,7 +2,6 @@ package io.streamsforge.engine.runtime;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -25,7 +24,7 @@ public final class ZSetIndex {
     }
 
     public void apply(String key, String rowCanonical, WorkingRow row, long weight) {
-        var bucket = byKey.computeIfAbsent(key, k -> new LinkedHashMap<>());
+        var bucket = byKey.computeIfAbsent(key, k -> new NetDictionary<>());
         var existing = bucket.get(rowCanonical);
         if (existing != null) {
             long newWeight = existing.weight() + weight;
