@@ -33,9 +33,10 @@ its own note on why `/docs` doesn't serve it automatically).
 
 **JVM port** (`java/`, Gradle, Java 21, run with `cd java && ./gradlew build`): a differential dataflow
 library (`dataflow`), a faithful port of `StreamsForge.Engine` (`engine`, 801/801 in-scope C# cases),
-table SQL on that dataflow differential-tested against the engine (`engine-dd` — it found real
-order-sensitivity bugs in table GROUP BY that exist in the C# engine too, `@Disabled` repros in
-`EngineIssuesTest`), an Orleans-grain-shaped actor SPI with three runtimes (`actors-futures`,
+table SQL on that dataflow differential-tested against the engine (`engine-dd` — it found that table
+GROUP BY value aggregates were order-sensitive when a retraction precedes its assertion, in the C# engine
+too; fixed in both, `TableReduceOrderInsensitivityTests`. Two ANSI deviations it found — SUM over all-NULL
+is 0, NOT IN with NULL — are still open as `@Disabled` repros in `EngineIssuesTest`), an Orleans-grain-shaped actor SPI with three runtimes (`actors-futures`,
 `actors-loom` virtual threads, `actors-pekko`), and a mini host on that SPI (`host`). Overview:
 [`java/README.md`](java/README.md). Hard rule 1 applies there too: a ported test's expectation is never
 edited to make the port pass.

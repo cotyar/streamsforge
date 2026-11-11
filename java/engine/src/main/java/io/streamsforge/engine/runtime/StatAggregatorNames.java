@@ -66,6 +66,9 @@ final class Moments {
 
     long count() { return count; }
 
+    /** All three moments are linear in the contributions: zero sums answer like a fresh accumulator. */
+    boolean isEmpty() { return count == 0 && sum == 0 && sumSquares == 0; }
+
     /** Population variance, or null when there is nothing to describe. Clamped at zero. */
     Double populationVariance() {
         if (count <= 0) return null;
@@ -101,6 +104,7 @@ final class VarianceZAggregator implements IZAggregator {
     VarianceZAggregator(boolean sample, boolean stdDev) { this.sample = sample; this.stdDev = stdDev; }
     @Override public void apply(Object value, long weight) { moments.apply(value, weight); }
     @Override public Object result() { return moments.result(sample, stdDev); }
+    @Override public boolean isEmpty() { return moments.isEmpty(); }
 }
 
 /**
@@ -112,22 +116,25 @@ final class NumericMultiset {
     private final TreeMap<Double, Long> counts = new TreeMap<>(SqlValues::compareDouble);
     private long total;
 
+    // SIGNED counts (see MinMaxZAggregator): a value retracted before it was asserted keeps a negative count
+    // until its assertion nets it out. total is the sum of POSITIVE counts — the population quantiles read.
     void apply(Object value, long weight) {
-        if (!SqlValues.isNumber(value)) return;
+        if (!SqlValues.isNumber(value) || weight == 0) return;
         double x = SqlValues.toDouble(value);
-        Long existing = counts.get(x);
-        long next = existing != null ? existing + weight : weight;
-        if (next <= 0) counts.remove(x);
+        long existing = counts.getOrDefault(x, 0L);
+        long next = existing + weight;
+        if (next == 0) counts.remove(x);
         else counts.put(x, next);
-        total += weight;
-        if (total < 0) total = 0;
+        total += Math.max(next, 0) - Math.max(existing, 0);
     }
+
+    boolean isEmpty() { return counts.isEmpty(); }
 
     /** Continuous quantile with linear interpolation (PERCENTILE_CONT; MEDIAN is p = 0.5). Null when empty. */
     Object quantile(double p) {
         if (counts.isEmpty() || total <= 0) return null;
-        if (p <= 0) return counts.firstKey();
-        if (p >= 1) return counts.lastKey();
+        if (p <= 0) return firstPositive(counts);
+        if (p >= 1) return firstPositive(counts.descendingMap());
 
         double rank = p * (total - 1);
         long lowerIndex = (long) Math.floor(rank);
@@ -137,6 +144,7 @@ final class NumericMultiset {
         long seen = 0;
         boolean haveLower = false;
         for (var e : counts.entrySet()) {
+            if (e.getValue() <= 0) continue;
             double value = e.getKey();
             seen += e.getValue();
             if (!haveLower && seen > lowerIndex) {
@@ -148,6 +156,11 @@ final class NumericMultiset {
             if (haveLower) { upper = value; return interpolate(lower, upper, fraction); }
         }
         return haveLower ? (Object) lower : null;
+    }
+
+    private static Object firstPositive(java.util.NavigableMap<Double, Long> ordered) {
+        for (var e : ordered.entrySet()) if (e.getValue() > 0) return e.getKey();
+        return null;
     }
 
     private static Object interpolate(double lower, double upper, double fraction) {
@@ -169,6 +182,7 @@ final class PercentileZAggregator implements IZAggregator {
     PercentileZAggregator(double p) { this.p = p; }
     @Override public void apply(Object value, long weight) { values.apply(value, weight); }
     @Override public Object result() { return values.quantile(p); }
+    @Override public boolean isEmpty() { return values.isEmpty(); }
 }
 
 /**
@@ -187,20 +201,25 @@ final class DistinctCountAggregator extends Aggregator implements IZAggregator {
         }
     }
 
+    // SIGNED counts (see MinMaxZAggregator): an early retraction is kept as a negative count rather than
+    // ignored; only positive counts are distinct values.
     private final Map<Key, Long> counts = new HashMap<>();
+    private long positive;
 
     @Override public void add(Object value) { apply(value, 1); }
 
     @Override public void apply(Object value, long weight) {
-        if (value == null) return;
+        if (value == null || weight == 0) return;
         var k = new Key(value);
-        Long existing = counts.get(k);
-        long next = existing != null ? existing + weight : weight;
-        if (next <= 0) counts.remove(k);
+        long existing = counts.getOrDefault(k, 0L);
+        long next = existing + weight;
+        if (next == 0) counts.remove(k);
         else counts.put(k, next);
+        positive += (next > 0 ? 1 : 0) - (existing > 0 ? 1 : 0);
     }
 
-    @Override public Object result() { return (long) counts.size(); }
+    @Override public Object result() { return positive; }
+    @Override public boolean isEmpty() { return counts.isEmpty(); }
 }
 
 final class MedianAggregator extends Aggregator {
@@ -213,4 +232,5 @@ final class MedianZAggregator implements IZAggregator {
     private final NumericMultiset values = new NumericMultiset();
     @Override public void apply(Object value, long weight) { values.apply(value, weight); }
     @Override public Object result() { return values.quantile(0.5); }
+    @Override public boolean isEmpty() { return values.isEmpty(); }
 }

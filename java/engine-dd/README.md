@@ -98,8 +98,8 @@ Coverage - **48 queries**, 300 cases x 8 epochs each:
 Totals per pass: in-order pass **115,200 epochs, 345,193 events (105,067 retractions)**; "load" pass (up to 30 events per
 epoch, 60 cases x 5 epochs per query) **14,400 epochs, 216,811 events**; "shuffled" pass (the same events delivered in
 random order within an epoch, so a retraction can reach the engine before the assertion it cancels; end-of-epoch state is
-compared) **79,200 epochs, 316,667 events** over the 33 queries without value aggregates (the other 15 are the
-`@Disabled` order-sensitivity finding below). Three queries also run with one input registered as a materialized table
+compared) **79,200 epochs, 316,667 events** over the 33 queries without value aggregates, plus the 15 value-aggregate
+queries in `engineValueAggregatesAreOrderInsensitiveWithinAnEpoch` (disabled until finding 2 was fixed, now green). Three queries also run with one input registered as a materialized table
 (`tableSchemas`) instead of a stream (200 cases x 8 epochs each).
 
 Comparing with the engine is only as good as the independence of the two sides. **Shared on purpose** (so not tested by
@@ -112,8 +112,8 @@ equality), `WorkingRow.combine`. **Independent**: every join / outer-join paddin
 Result of running the above: **after one dialect alignment (1) the two sides agree on every in-order case; every remaining
 disagreement is a defect of the engine** (the dataflow side is order-insensitive Z-set algebra by construction). Repros are
 `@Disabled` tests in `EngineIssuesTest` that assert the *correct* answer; run them with
-`./gradlew :engine-dd:test -Djunit.jupiter.conditions.deactivate='org.junit.*DisabledCondition'` to see them fail (5 failures
-there + 15 in the shuffled aggregate test).
+`./gradlew :engine-dd:test -Djunit.jupiter.conditions.deactivate='org.junit.*DisabledCondition'` to see them fail (3 still
+open: findings 1 and 3; finding 2 is fixed and its repros run as ordinary tests).
 
 1. **`SUM` over a group whose argument is NULL in every row returns `0`; ANSI SQL says NULL. Engine wrong (dialect
    deviation, internally inconsistent).** The engine's `AVG`/`MIN`/`MAX` (and `VAR_SAMP`, whose doc says "undefined, not
@@ -121,8 +121,10 @@ there + 15 in the shuffled aggregate test).
    differential run (the dataflow side followed ANSI). `DataflowTableCompiler.Options(sqlStandardEmptySum)` selects either;
    the default matches the engine so the suites can compare. Repro: `engineSumOfOnlyNullsIsNull` (disabled); current
    behaviour pinned by `engineSumOfNothingIsZeroWhileAvgMinAreNull_pinsCurrentBehaviour`.
-2. **GROUP BY value aggregates are not order-insensitive: a retraction that reaches the engine before the assertion it
-   cancels corrupts the group. Engine wrong.** `TableOuterJoin`/join/semi/anti/union/unnest survive arbitrary reordering,
+2. **FIXED 2026-11-11 in both the C# engine and this port** (`TableReduceOp` drops a zero-weight group only when every
+   aggregator reports `IsEmpty`; MIN/MAX, COUNT(DISTINCT) and the quantile multiset keep signed counts; regression tests
+   `TableReduceOrderInsensitivityTests` in both test suites). Original finding: **GROUP BY value aggregates are not
+   order-insensitive: a retraction that reaches the engine before the assertion it cancels corrupts the group. Engine wrong.** `TableOuterJoin`/join/semi/anti/union/unnest survive arbitrary reordering,
    but `TableReduceOp` removes a group's state when its total weight crosses exactly 0 (`groups.remove(key)`) although the
    aggregators then hold a non-empty `{+r2, -r1}` multiset; the later assertion of `r1` starts a fresh group holding only `r1`.
    Repro: retract(r1: qty 5), assert(r2: qty 7), assert(r1) -> `SUM = MAX = 5`, correct `7` (`engineGroupByIsOrderInsensitive`).
@@ -130,8 +132,8 @@ there + 15 in the shuffled aggregate test).
    lost even when the group stays alive: rows {3, 4} then retract(5), assert(5) -> `MAX = 5`, correct `4`
    (`engineMaxIgnoresRetractionOfUnseenValue`). `COUNT(*)`-only groups are unaffected. This matters in practice: the
    engine's own `unmatchedRetractions` counter and the doc comment on the negative-total case show the authors know
-   retractions can arrive first. The parameterized `engineValueAggregatesAreOrderInsensitiveWithinAnEpoch` (disabled) is the
-   differential form: 15 queries fail.
+   retractions can arrive first. The parameterized `engineValueAggregatesAreOrderInsensitiveWithinAnEpoch` is the
+   differential form: 15 queries failed before the fix and pass after it.
 3. **`x NOT IN (subquery)` and NULL (ANSI deviation shared by engine and dataflow compiler).** ANSI: a NULL in the subquery
    makes `NOT IN` UNKNOWN for every non-matching x (no rows); `NULL NOT IN (empty set)` is TRUE. `TableSemiAntiOp`
    ignores NULL right keys ("the NOT IN NULL rule" in its comment) and drops every NULL left key even for an empty

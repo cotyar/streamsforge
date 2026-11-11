@@ -43,6 +43,7 @@ final class CountZAggregator implements IZAggregator {
     CountZAggregator(boolean isStar) { this.isStar = isStar; }
     @Override public void apply(Object value, long weight) { if (isStar || value != null) count += weight; }
     @Override public Object result() { return count; }
+    @Override public boolean isEmpty() { return count == 0; }
 }
 
 final class SumZAggregator implements IZAggregator {
@@ -56,6 +57,9 @@ final class SumZAggregator implements IZAggregator {
     }
 
     @Override public Object result() { return sawDouble ? (Object) sum : (Object) longSum; }
+
+    // Linear: zero sums answer like a fresh accumulator for every future contribution.
+    @Override public boolean isEmpty() { return sum == 0 && longSum == 0; }
 }
 
 final class AvgZAggregator implements IZAggregator {
@@ -68,28 +72,38 @@ final class AvgZAggregator implements IZAggregator {
     }
 
     @Override public Object result() { return count == 0 ? null : (Object) (sum / count); }
+    @Override public boolean isEmpty() { return count == 0 && sum == 0; }
 }
 
-/** Per-group multiset of contributing values, ordered by SqlValues.compare — MIN/MAX read the first/last key.
- *  Retraction decrements the count; a value's entry is pruned once its count reaches zero. */
+/** Per-group SIGNED multiset of contributing values, ordered by SqlValues.compare — MIN/MAX read the first/last
+ *  value whose count is positive. An entry is pruned only at exactly zero; a value retracted BEFORE it was
+ *  asserted keeps a negative count (it used to be ignored, so the later assertion resurrected it: rows {3, 4},
+ *  then -5, then +5 reported MAX 5 instead of 4) and stays invisible until its assertion nets it out. */
 final class MinMaxZAggregator implements IZAggregator {
     private final boolean isMin;
     private final TreeMap<Object, Long> multiset = new TreeMap<>(SqlValues::compare);
     MinMaxZAggregator(boolean isMin) { this.isMin = isMin; }
 
+    private int negativeEntries;
+
     @Override public void apply(Object value, long weight) {
-        if (value == null) return;
-        Long existing = multiset.get(value);
-        if (existing != null) {
-            long newWeight = existing + weight;
-            if (newWeight <= 0) multiset.remove(value);
-            else multiset.put(value, newWeight);
-        } else if (weight > 0) {
-            multiset.put(value, weight);
-        }
+        if (value == null || weight == 0) return;
+        long existing = multiset.getOrDefault(value, 0L);
+        long newWeight = existing + weight;
+        if (existing < 0) negativeEntries--;
+        if (newWeight < 0) negativeEntries++;
+        if (newWeight == 0) multiset.remove(value);
+        else multiset.put(value, newWeight);
     }
 
     @Override public Object result() {
-        return multiset.isEmpty() ? null : isMin ? multiset.firstKey() : multiset.lastKey();
+        if (multiset.isEmpty()) return null;
+        if (negativeEntries == 0) return isMin ? multiset.firstKey() : multiset.lastKey();
+        for (var e : (isMin ? multiset : multiset.descendingMap()).entrySet()) {
+            if (e.getValue() > 0) return e.getKey();
+        }
+        return null;
     }
+
+    @Override public boolean isEmpty() { return multiset.isEmpty(); }
 }

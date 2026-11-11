@@ -71,6 +71,10 @@ internal sealed class Moments
 
     public long Count => _count;
 
+    /// <summary>All three moments are linear in the contributions, so zero sums answer like a fresh
+    /// accumulator (the offset only re-centres; a later value re-derives the same results).</summary>
+    public bool IsEmpty => _count == 0 && _sum == 0 && _sumSquares == 0;
+
     /// <summary>Population variance, or null when there is nothing to describe. Clamped at zero: the
     /// sums form can produce a tiny negative from rounding when every value is identical, and a negative
     /// variance would become NaN in STDDEV.</summary>
@@ -109,6 +113,7 @@ internal sealed class VarianceZAggregator(bool sample, bool stdDev) : IZAggregat
     private readonly Moments _moments = new();
     public void Apply(object? value, long weight) => _moments.Apply(value, weight);
     public object? Result => _moments.Result(sample, stdDev);
+    public bool IsEmpty => _moments.IsEmpty;
 }
 
 /// <summary>
@@ -123,27 +128,32 @@ internal sealed class VarianceZAggregator(bool sample, bool stdDev) : IZAggregat
 /// </summary>
 internal sealed class NumericMultiset
 {
+    // SIGNED counts (see MinMaxZAggregator): a value retracted before it was asserted keeps a negative
+    // count until its assertion nets it out, instead of being ignored and then resurrected. _total is
+    // the sum of POSITIVE counts only — the population the quantile is read from.
     private readonly SortedDictionary<double, long> _counts = [];
     private long _total;
 
     public void Apply(object? value, long weight)
     {
-        if (!SqlValues.IsNumber(value)) return;
+        if (!SqlValues.IsNumber(value) || weight == 0) return;
         double x = SqlValues.ToDouble(value!);
-        long next = _counts.TryGetValue(x, out var existing) ? existing + weight : weight;
-        if (next <= 0) _counts.Remove(x);
+        long existing = _counts.TryGetValue(x, out var e) ? e : 0;
+        long next = existing + weight;
+        if (next == 0) _counts.Remove(x);
         else _counts[x] = next;
-        _total += weight;
-        if (_total < 0) _total = 0;
+        _total += Math.Max(next, 0) - Math.Max(existing, 0);
     }
+
+    public bool IsEmpty => _counts.Count == 0;
 
     /// <summary>Continuous quantile with linear interpolation between the two bracketing observations —
     /// the PERCENTILE_CONT definition, of which MEDIAN is p = 0.5. Null on an empty multiset.</summary>
     public object? Quantile(double p)
     {
         if (_counts.Count == 0 || _total <= 0) return null;
-        if (p <= 0) return _counts.Keys.First();
-        if (p >= 1) return _counts.Keys.Last();
+        if (p <= 0) return _counts.First(kv => kv.Value > 0).Key;
+        if (p >= 1) return _counts.Last(kv => kv.Value > 0).Key;
 
         // Rank in [0, n-1] of the quantile, then the two observations that bracket it.
         double rank = p * (_total - 1);
@@ -155,6 +165,7 @@ internal sealed class NumericMultiset
         bool haveLower = false;
         foreach (var (value, count) in _counts)
         {
+            if (count <= 0) continue;
             seen += count;
             if (!haveLower && seen > lowerIndex)
             {
@@ -185,6 +196,7 @@ internal sealed class PercentileZAggregator(double p) : IZAggregator
     private readonly NumericMultiset _values = new();
     public void Apply(object? value, long weight) => _values.Apply(value, weight);
     public object? Result => _values.Quantile(p);
+    public bool IsEmpty => _values.IsEmpty;
 }
 
 /// <summary>
@@ -195,19 +207,26 @@ internal sealed class PercentileZAggregator(double p) : IZAggregator
 /// </summary>
 internal sealed class DistinctCountAggregator : Aggregator, IZAggregator
 {
+    // SIGNED counts (see MinMaxZAggregator): a retraction that arrives before its assertion is kept as a
+    // negative count rather than ignored, so the later assertion nets it out instead of counting a value
+    // the input no longer holds. Only positive counts are distinct values.
     private readonly Dictionary<object, long> _counts = new(SqlValueEqualityComparer.Instance);
+    private long _positive;
 
     public override void Add(object? value) => Apply(value, 1);
 
     public void Apply(object? value, long weight)
     {
-        if (value is null) return;
-        long next = _counts.TryGetValue(value, out var existing) ? existing + weight : weight;
-        if (next <= 0) _counts.Remove(value);
+        if (value is null || weight == 0) return;
+        long existing = _counts.TryGetValue(value, out var e) ? e : 0;
+        long next = existing + weight;
+        if (next == 0) _counts.Remove(value);
         else _counts[value] = next;
+        _positive += (next > 0 ? 1 : 0) - (existing > 0 ? 1 : 0);
     }
 
-    public override object? Result => (long)_counts.Count;
+    public override object? Result => _positive;
+    public bool IsEmpty => _counts.Count == 0;
 }
 
 /// <summary>Equality for DISTINCT keys that agrees with <see cref="SqlValues.Compare"/> — notably that
@@ -236,6 +255,7 @@ internal sealed class MedianZAggregator : IZAggregator
     private readonly NumericMultiset _values = new();
     public void Apply(object? value, long weight) => _values.Apply(value, weight);
     public object? Result => _values.Quantile(0.5);
+    public bool IsEmpty => _values.IsEmpty;
 }
 
 /// <summary>Reads a parameterised aggregate's constant out of the parsed call. The Validator has

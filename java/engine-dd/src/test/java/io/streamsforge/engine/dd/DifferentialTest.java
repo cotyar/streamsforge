@@ -122,9 +122,7 @@ class DifferentialTest {
 
     @ParameterizedTest(name = "{0} (shuffled)")
     @MethodSource("valueAggregateQueries")
-    @org.junit.jupiter.api.Disabled("bug: engine value aggregates (SUM/MIN/MAX/AVG/COUNT(x)/COUNT(DISTINCT)) are order-sensitive - a retraction "
-        + "that precedes its assertion corrupts the group; minimal repro: EngineIssuesTest.engineGroupByIsOrderInsensitive. "
-        + "Run with -Djunit.jupiter.conditions.deactivate=org.junit.*DisabledCondition to see the 15 failing queries.")
+    // Was @Disabled: engine value aggregates were order-sensitive; fixed in TableReduceOp + the Z-aggregators (2026-11-11).
     void engineValueAggregatesAreOrderInsensitiveWithinAnEpoch(String name, String sql) {
         Diff.run(sql, Diff.ALL, null, name.hashCode() + 11, CASES, EPOCHS, 8, new Diff.Feed[] {Diff.Feed.SHUFFLED});
     }

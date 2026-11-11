@@ -93,10 +93,17 @@ internal sealed class TableReduceOp : ITableOp
         {
             results.Add(new TableDelta(BuildRow(state), 1));
         }
-        else if (state.TotalWeight == 0)
+        else if (state.TotalWeight == 0 && state.Aggregators.All(a => a.IsEmpty))
         {
-            // Exactly zero is a group that genuinely has no rows — drop it, which is what keeps a
-            // long-lived table from accumulating dead groups.
+            // Exactly zero weight AND nothing left in any accumulator is a group that genuinely has no
+            // rows — drop it, which is what keeps a long-lived table from accumulating dead groups.
+            //
+            // Zero weight alone is NOT enough: a retraction that arrives before its own assertion leaves
+            // {+r2, −r1} — weight 0, but SUM/MIN/MAX state r2 − r1. Dropping that (as this branch used to)
+            // made the group restart from r1's assertion alone and report r1's values where the input
+            // holds r2: GROUP BY results depended on delivery order. Such a group is kept, emits nothing
+            // while its weight is not positive, and converges once the missing assertion lands. Found by
+            // java/engine-dd's shuffled differential test (EngineIssuesTest.engineGroupByIsOrderInsensitive).
             Groups.Remove(key);
         }
         // NEGATIVE weight is deliberately KEPT, where it used to be dropped along with the group's

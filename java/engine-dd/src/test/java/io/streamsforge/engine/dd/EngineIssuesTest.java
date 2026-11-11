@@ -66,9 +66,7 @@ class EngineIssuesTest {
     }
 
     @Test
-    @Disabled("bug: TableReduceOp drops a group's state when its total weight crosses exactly 0 even though the aggregators "
-        + "still hold a non-empty (+r2, -r1) multiset, so a retraction arriving before its assertion leaves the group with r1's "
-        + "values instead of r2's (SUM=5, MAX=5; correct: 7). Z-set aggregation must be order-insensitive.")
+    // Fixed 2026-11-11 (was @Disabled) — see engine TableReduceOrderInsensitivityTests.
     void engineGroupByIsOrderInsensitive() {
         var e = engine(GROUPED);
         e.onTableDelta("trades", new TableDelta(trade(1, "A", 1.0, 5L), -1));
@@ -80,8 +78,7 @@ class EngineIssuesTest {
 
     /** MIN/MAX in isolation: the group's total weight never reaches 0 here, so the state drop above is not involved. */
     @Test
-    @Disabled("bug: MinMaxZAggregator ignores a retraction of a value it has not seen (only `weight > 0` creates an entry), so "
-        + "retract(5) before assert(5) leaves 5 in the multiset with net weight 0: MAX stays 5 although the rows are {3, 4}.")
+    // Fixed 2026-11-11 (was @Disabled) — see engine TableReduceOrderInsensitivityTests.
     void engineMaxIgnoresRetractionOfUnseenValue() {
         var e = engine("SELECT sym, MAX(qty) AS mx, COUNT(*) AS c FROM trades GROUP BY sym");
         e.onTableDelta("trades", new TableDelta(trade(0, "B", 1.0, 3L), 1));

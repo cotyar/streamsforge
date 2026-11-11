@@ -19,16 +19,16 @@ cd java && ./gradlew build          # everything, ~1 min
 | `actors-pekko` | SPI over Apache Pekko typed actors (Cluster-Sharding-style passivation, stash while an async turn runs). | ↑ |
 | `host` | Mini StreamsForge host written once on the SPI: registry, sources, pipelines (watermark timers), tables incl. coordinator mode for parallelism ≥ 2 (epochs, markers, frontier min-combine, exchange), table-over-table late attach. Every scenario test runs on all three runtimes. | [host/README.md](host/README.md) |
 
-## Known engine bugs found by `engine-dd` (present in the C# original too)
+## Engine bugs found by `engine-dd` (present in the C# original too)
 
-`engine-dd/src/test/.../EngineIssuesTest` holds `@Disabled` repros; details in
-[engine-dd/README.md](engine-dd/README.md):
+Details in [engine-dd/README.md](engine-dd/README.md); open ones have `@Disabled` repros in `EngineIssuesTest`.
 
-1. Table-mode GROUP BY value aggregates (SUM/MIN/MAX/AVG/COUNT(x)/COUNT DISTINCT) are order-sensitive when
-   a retraction arrives before its assertion: `TableReduceOp` drops a group at total weight exactly 0, and
-   `MinMaxZAggregator` ignores a retraction of a value it has not seen.
-2. `SUM` over an all-NULL group yields 0, while AVG/MIN/MAX yield NULL.
-3. `NOT IN` with NULLs is not ANSI (undocumented; possibly intended).
+1. **Fixed (C# and Java, 2026-11-11):** table-mode GROUP BY value aggregates (SUM/MIN/MAX/AVG/COUNT(x)/
+   COUNT DISTINCT/quantiles) were order-sensitive when a retraction arrived before its assertion —
+   `TableReduceOp` dropped a group at total weight exactly 0, and the multiset aggregates ignored a retraction
+   of a value they had not seen. Regression tests: `TableReduceOrderInsensitivityTests` in both engines.
+2. **Open:** `SUM` over an all-NULL group yields 0, while AVG/MIN/MAX yield NULL.
+3. **Open:** `NOT IN` with NULLs is not ANSI (undocumented; possibly intended).
 
 ## What it is not
 

@@ -78,8 +78,12 @@ public final class TableReduceOp implements ITableOp {
 
         if (state.totalWeight > 0) {
             results.add(new TableDelta(buildRow(state), 1));
-        } else if (state.totalWeight == 0) {
-            // Exactly zero is a group that genuinely has no rows — drop it.
+        } else if (state.totalWeight == 0 && java.util.Arrays.stream(state.aggregators).allMatch(IZAggregator::isEmpty)) {
+            // Zero weight AND nothing left in any accumulator is a group that genuinely has no rows — drop it.
+            // Zero weight alone is not enough: a retraction that arrives before its own assertion leaves
+            // {+r2, -r1} (weight 0, SUM r2 - r1); dropping that made GROUP BY depend on delivery order. Such a
+            // group is kept, emits nothing while its weight is not positive, and converges once the missing
+            // assertion lands. Mirrors the C# fix (TableReduceOrderInsensitivityTests).
             groups.remove(key);
         }
         return results;
