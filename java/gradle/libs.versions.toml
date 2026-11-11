@@ -1,0 +1,8 @@
+[versions]
+pekko = "1.1.5"
+jackson = "2.18.2"
+
+[libraries]
+pekko-actor-typed = { module = "org.apache.pekko:pekko-actor-typed_2.13", version.ref = "pekko" }
+pekko-actor-testkit-typed = { module = "org.apache.pekko:pekko-actor-testkit-typed_2.13", version.ref = "pekko" }
+jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
