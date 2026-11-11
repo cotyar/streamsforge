@@ -244,7 +244,12 @@ genuinely needs to replace built-in behavior needs a different name, or a PR to 
   framework for. Not changed here — untested whether anything in either Dockerfile's runtime stage (the
   `curl` install for the Orleans healthcheck, `bash`'s `/dev/tcp` use in the Dapr entrypoint) still needs
   something `runtime-deps` drops.
-- **The 6 pre-existing test failures** — restart/reactivation tests in `CrdtDocGrainClusterTests` (3),
+- **The 6 pre-existing test failures — FIXED 2026-11-11** (root causes below the original note: five were
+  Orleans' default Newtonsoft `$type` in-memory grain storage serializer refusing a plugin-defined state
+  type the silo's manifest did not list — the silo log said `Type "StreamsForge.Host.Grains.CrdtDocGrainState"
+  is not allowed`; replaced by `Host/Storage/GrainStorageSerializers.cs`. The sixth was a running
+  connector pinned by `DelayDeactivation(Infinite)` since `bd147ce`, which `ForceActivationCollection`
+  cannot collect; the test now calls `IGrainManagementExtension.DeactivateOnIdle()`.) Original note: restart/reactivation tests in `CrdtDocGrainClusterTests` (3),
   `ShardedTableClusterTests` (2) and `ConnectorGrainPolledClusterTests` (1,
   `ADeactivatedConnectorResumesFromThePersistedCursor`), failing deterministically with
   `CodecNotFoundException(Newtonsoft.Json.JsonSerializationException)` — were independently verified

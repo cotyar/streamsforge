@@ -7,6 +7,7 @@ using StreamsForge.Abstractions;
 using StreamsForge.Engine;
 using StreamsForge.Host.Facades;
 using Xunit;
+using StreamsForge.Host.Storage;
 
 namespace StreamsForge.Host.Tests;
 
@@ -17,8 +18,8 @@ internal sealed class ReplayFromTestSiloConfigurator : ISiloConfigurator
     public void Configure(ISiloBuilder siloBuilder)
     {
         siloBuilder.AddMemoryStreams(StreamConstants.ProviderName);
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.PubSubStoreName);
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.StorageName);
+        siloBuilder.AddPubSubMemoryGrainStorage(StreamConstants.PubSubStoreName);
+        siloBuilder.AddJsonMemoryGrainStorage(StreamConstants.StorageName);
     }
 }
 

@@ -81,7 +81,7 @@ internal sealed class PersistenceModeTestSiloConfigurator : ISiloConfigurator
     public void Configure(ISiloBuilder siloBuilder)
     {
         siloBuilder.AddMemoryStreams(StreamConstants.ProviderName);
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.PubSubStoreName);
+        siloBuilder.AddPubSubMemoryGrainStorage(StreamConstants.PubSubStoreName);
         siloBuilder.ConfigureServices(services =>
         {
             services.AddGrainStorage(StreamConstants.StorageName, (sp, providerName) =>

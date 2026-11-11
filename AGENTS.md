@@ -112,13 +112,22 @@ still blank) and can be a single TypeScript file (`.ts`/`.tsx`, no `import`s) tr
 via a lazily-downloaded `sucrase`; `GET /api/ui-plugins` is `Cache-Control: no-store` with a `?v=` on
 every URL, so a plain reload (not a hard one) picks up an edited file. The server-side loader is now
 two-pass (load every DLL in `plugins/` before scanning any for `IStreamsForgePlugin` — order-independent)
-and logs a line when a plugin references a newer assembly version than the host has loaded. **Six
-pre-existing test failures, not
-caused by this plan**: restart/reactivation tests in `CrdtDocGrainClusterTests` (3),
-`ShardedTableClusterTests` (2) and `ConnectorGrainPolledClusterTests` (1,
-`ADeactivatedConnectorResumesFromThePersistedCursor`) fail deterministically with
-`CodecNotFoundException(Newtonsoft.Json.JsonSerializationException)`, verified failing before this
-work at `bfc421f`; see `plans/022-plugins-and-single-file.md`'s found-and-not-fixed list for status.
+and logs a line when a plugin references a newer assembly version than the host has loaded. **The six
+"pre-existing" restart/reactivation failures this plan recorded are fixed (2026-11-11)**: five
+(`CrdtDocGrainClusterTests` ×3, `ShardedTableClusterTests` ×2) were Orleans' default in-memory grain
+storage serializer — Newtonsoft with a `$type` name checked against the silo's type manifest, which
+does not hold a type that only a plugin assembly defines (`CrdtDocGrainState`), and whose
+`JsonSerializationException` could not be carried back to the test client, hence
+`CodecNotFoundException`. Every `AddMemoryGrainStorage` in the host and the tests now goes through
+`Host/Storage/GrainStorageSerializers.cs` instead: `AddJsonMemoryGrainStorage` (System.Text.Json with
+`JsonFileGrainStorage`'s own options, so a test cluster round-trips state the way the file store does)
+and `AddPubSubMemoryGrainStorage` (Orleans' binary serializer, which pub/sub's own state needs). The
+sixth (`ConnectorGrainPolledClusterTests.ADeactivatedConnectorResumesFromThePersistedCursor`) was a
+different, newer cause: since `bd147ce` a running connector pins itself with
+`DelayDeactivation(Infinite)`, so `ForceActivationCollection` never collected it; the test now
+deactivates the grain explicitly through `IGrainManagementExtension.DeactivateOnIdle()`. No code path of
+ours calls Newtonsoft.Json any more — Orleans 10.3 still ships the assembly, and the `external/ycs`
+fork's v1-format JSON moved to System.Text.Json the same day (`Utils/YJson.cs`, `JSON.stringify` rules).
 Test counts move slightly from this plan's own AppCore.Tests additions (the plugin-loader and
 `UiPluginsEndpointsTests` coverage) — treat the exact whole-suite numbers elsewhere in this file as
 approximate until the next verification pass confirms them.
@@ -348,7 +357,7 @@ pinned to the fork's `parity-yjs-13.6.32` branch, NOT `main`; see that project's
 
 ```bash
 ~/.dotnet/dotnet build orleans/StreamsForge.sln
-~/.dotnet/dotnet test  orleans/StreamsForge.sln     # 3746 tests — green except the 6 known pre-existing failures (see plans/022); includes StreamsForge.Chain.Tests, which spawns real hosts on 9399–9899 (skips with a named reason if a port is busy)
+~/.dotnet/dotnet test  orleans/StreamsForge.sln     # 3833 tests — green apart from the time-bounded flakes listed below; includes StreamsForge.Chain.Tests, which spawns real hosts on 9399–9899 (skips with a named reason if a port is busy)
 ~/.dotnet/dotnet build dapr/StreamsForge.Dapr.sln
 ~/.dotnet/dotnet test  dapr/StreamsForge.Dapr.sln   # ~1640 + the Live project (needs `dapr init`, skips with a named reason otherwise)
 cd clients/typescript && bun test  # 14 contract + conformance/live-table; boots its own engine on 8199/8299
@@ -432,6 +441,11 @@ count is the precondition for proving truncation, not the assertion) and the pre
 `ConnectorGrainClusterTests.Missing_file_reports_error_status_with_growing_backoff` (waits for a
 missing-file source's second failed poll so `ConsecutiveFailures` grows past 1 — a poll cadence race
 under load, not logic).
+`BatchReplayGrpcTests.Grpc_SubscribePipeline_rows_of_one_batch_share_its_position` (added 2026-11-11, seen
+once in a whole-solution run, 200 rows read where 100 were expected, and 3/3 green under `--filter` right
+after): the same plan 023 "ONE GAP" overlap as the two `ReplayFromClusterTests` above — under load the
+subscription lands while the pull agent is still a period behind, so one batch arrives both through the
+replay and live. Its 2 s quiesce is sized for an idle machine; the doubled count is the signature.
 Dapr side, same family: `StreamingDaprStreamBridgeTests.OnLifecycleEventAsync_SourceDeleted_ForgetsThisBridgesOwnPacingState`
 asserts a forgotten source relays "immediately" (a sub-100 ms bound) — it lost twice on 2026-09-14, both
 times while an Orleans whole-solution run was hogging the CPU beside it (219 ms, 150 ms), and passed 13/13

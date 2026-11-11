@@ -21,7 +21,7 @@ public sealed partial class JsonFileGrainStorage(string name, string dataDir) : 
     /// (indented) build still deserialize through this same options object unchanged — see
     /// JsonFileGrainStorageTests' round-trip-an-indented-file test. If a human ever needs to read one,
     /// `jq .` on the file does the job without making every process pay for it.</summary>
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
+    internal static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
 
     /// <summary>The named provider identity, kept for diagnostics/logging.</summary>
     public string Name { get; } = name;

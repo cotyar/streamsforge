@@ -5,6 +5,7 @@ using Orleans.Runtime;
 using Orleans.TestingHost;
 using StreamsForge.Abstractions;
 using Xunit;
+using StreamsForge.Host.Storage;
 
 namespace StreamsForge.Host.Tests;
 
@@ -13,7 +14,7 @@ namespace StreamsForge.Host.Tests;
 internal sealed class AccessPolicyTestSiloConfigurator : ISiloConfigurator
 {
     public void Configure(ISiloBuilder siloBuilder) =>
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.StorageName);
+        siloBuilder.AddJsonMemoryGrainStorage(StreamConstants.StorageName);
 }
 
 internal sealed class AccessPolicyTestClientConfigurator : IClientBuilderConfigurator

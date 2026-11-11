@@ -10,7 +10,7 @@ namespace StreamsForge.Plugins.Crdt;
 /// Installs the Orleans CRDT document runtime (<c>CrdtDocGrain</c>, dispatched to via
 /// <c>SourceKindDispatch.ActorKind.Crdt</c>) as a server plugin instead of a host ProjectReference.
 /// Merged to one self-contained DLL by <c>plugins/ILRepack.Plugins.targets</c> (StreamsForge.Connectors.Crdt
-/// + Ycs; Newtonsoft.Json is NOT merged because Orleans itself ships it — see this project's csproj) — an
+/// + Ycs, which has no third-party dependency of its own) — an
 /// operator installs this by copying ONE file
 /// into the host's <c>plugins/</c> directory (or wherever <c>Plugins:Path</c> points).
 ///

@@ -141,9 +141,9 @@ installed" rather than throwing a missing-DI-registration exception.
 
 The plugin project also carries `CrdtDocGrain` (the Orleans grain that owns one Yjs document and
 projects it to rows) and merges `StreamsForge.Connectors.Crdt` and `Ycs` (the `external/ycs` submodule's
-build output) into its output DLL — **not** `Newtonsoft.Json`, even though Ycs depends on it: Orleans
-10.3's own packages ship Newtonsoft.Json 13.0.4, so the host has it regardless, and merging a second
-copy would be exactly the duplicate-type hazard the merge rule exists to avoid. The grain type is
+build output) into its output DLL. Ycs brings no third-party dependency of its own: its v1-format JSON
+(formatting attributes, embeds) goes through System.Text.Json with `JSON.stringify` number and string
+rules (`external/ycs/src/Ycs/Utils/YJson.cs`), not Newtonsoft.Json as it did before 2026-11-11. The grain type is
 discoverable by the silo through the host's two-step manifest registration (hook order step 3 above),
 with zero CRDT-specific code in the host.
 

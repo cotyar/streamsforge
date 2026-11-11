@@ -19,7 +19,7 @@
          CrdtProjector.Flatten/Diff/EscrowCounter directly, the same "out-of-core connector project" shape
          StreamsForge.Connectors.Database has in the host). Merged into the plugin DLL below because,
          unlike StreamsForge.Abstractions/Api, the host no longer ships this assembly (or its own
-         Ycs/Newtonsoft.Json dependency) once this plugin replaces the host's direct reference. -->
+         Ycs dependency) once this plugin replaces the host's direct reference. -->
     <ProjectReference Include="..\..\shared\StreamsForge.Connectors.Crdt\StreamsForge.Connectors.Crdt.csproj" />
   </ItemGroup>
 
@@ -27,14 +27,10 @@
     <!-- Everything this plugin brings that the host does NOT already ship, by assembly file base name
          (no extension) — see ILRepack.Plugins.targets for what this drives.
          StreamsForge.Connectors.Crdt and Ycs: the host no longer ships either once this merge replaces
-         its direct StreamsForge.Connectors.Crdt reference. Newtonsoft.Json is DELIBERATELY NOT merged,
-         unlike Ycs's own transitive dependency on it (external/ycs/src/Ycs/Ycs.csproj, 13.0.3) would
-         suggest — verified against a real build: Microsoft.Orleans.Core/Runtime/Server/Streaming
-         (10.3.0) already depend on Newtonsoft.Json 13.0.4 themselves, so the host ships it regardless of
-         this plugin (NuGet floats Ycs's 13.0.3 requirement up to the host's 13.0.4, which stays binary
-         compatible) — merging it in too would just duplicate a type the host already has, exactly the
-         hazard this file's own class doc warns against. Referenced by name via the ProjectReference
-         above, same as every StreamsForge.*/Orleans* dependency. -->
+         its direct StreamsForge.Connectors.Crdt reference. Ycs has no third-party dependency of its own
+         to merge: since 2026-11-11 its v1-format JSON goes through System.Text.Json (in the box on
+         net10.0), not Newtonsoft.Json — which Orleans 10.3 still ships, but nothing on this plugin's
+         path calls any more. -->
     <PluginMergeAssembly Include="StreamsForge.Connectors.Crdt" />
     <PluginMergeAssembly Include="Ycs" />
   </ItemGroup>

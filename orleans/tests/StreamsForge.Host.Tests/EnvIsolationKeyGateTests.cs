@@ -14,7 +14,7 @@ internal sealed class EnvKeyGateSiloConfigurator : ISiloConfigurator
     public void Configure(ISiloBuilder siloBuilder)
     {
         siloBuilder.AddMemoryStreams(StreamConstants.ProviderName);
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.PubSubStoreName);
+        siloBuilder.AddPubSubMemoryGrainStorage(StreamConstants.PubSubStoreName);
         siloBuilder.AddJsonFileGrainStorage(StreamConstants.StorageName);
     }
 }

@@ -5,6 +5,7 @@ using Orleans.TestingHost;
 using StreamsForge.Abstractions;
 using StreamsForge.AppCore.Environments;
 using Xunit;
+using StreamsForge.Host.Storage;
 
 namespace StreamsForge.Host.Tests;
 
@@ -16,8 +17,8 @@ internal sealed class EnvIsolationSiloConfigurator : ISiloConfigurator
     public void Configure(ISiloBuilder siloBuilder)
     {
         siloBuilder.AddMemoryStreams(StreamConstants.ProviderName);
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.PubSubStoreName);
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.StorageName);
+        siloBuilder.AddPubSubMemoryGrainStorage(StreamConstants.PubSubStoreName);
+        siloBuilder.AddJsonMemoryGrainStorage(StreamConstants.StorageName);
     }
 }
 

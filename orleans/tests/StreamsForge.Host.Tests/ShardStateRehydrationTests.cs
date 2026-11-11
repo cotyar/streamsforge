@@ -13,10 +13,12 @@ namespace StreamsForge.Host.Tests;
 /// A shard's whole purpose is to deactivate and come back from storage. In production that storage is
 /// <c>JsonFileGrainStorage</c>, and System.Text.Json materializes every value of an untyped
 /// <c>Dictionary&lt;string, object?&gt;</c> as a boxed <see cref="JsonElement"/>. A cluster test using
-/// <c>AddMemoryGrainStorage</c> round-trips through the Orleans serializer instead and preserves the CLR
-/// types, so it is structurally incapable of catching this — which is exactly what happened: the wave's
+/// Orleans' default memory storage round-tripped through a different serializer that preserved the CLR
+/// types, so it was structurally incapable of catching this — which is exactly what happened: the wave's
 /// live check hit an HTTP 500 on the first lookup of a deactivated shard, because Orleans has no
-/// serializer for JsonElement and the grain was handing one straight back in a response.
+/// serializer for JsonElement and the grain was handing one straight back in a response. (Since
+/// 2026-11-11 the cluster tests use <c>AddJsonMemoryGrainStorage</c>, which serializes with
+/// JsonFileGrainStorage's own System.Text.Json options, so they now see the same JsonElement values.)
 ///
 /// These tests pin both halves of the fix: that the hazard is real (a round-trip really does produce
 /// JsonElement), and that normalizing restores values a live shard would be indistinguishable from —

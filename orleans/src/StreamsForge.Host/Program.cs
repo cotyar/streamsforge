@@ -230,7 +230,7 @@ builder.Host.UseOrleans(siloBuilder =>
             configurator.ConfigurePullingAgent(ob => ob.Configure(o =>
                 o.GetQueueMsgsTimerPeriod = TimeSpan.FromMilliseconds(pullPeriodMs))));
     }
-    siloBuilder.AddMemoryGrainStorage(StreamConstants.PubSubStoreName);
+    siloBuilder.AddPubSubMemoryGrainStorage(StreamConstants.PubSubStoreName);
     siloBuilder.AddJsonFileGrainStorage(StreamConstants.StorageName);
 
     // CRDT-as-a-plugin: a grain class living in a dynamically loaded plugin DLL (StreamsForge.Plugins.Crdt

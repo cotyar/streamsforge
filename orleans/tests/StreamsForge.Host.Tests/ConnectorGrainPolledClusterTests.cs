@@ -9,6 +9,8 @@ using StreamsForge.AppCore.Transports;
 using StreamsForge.Engine;
 using StreamsForge.Host.Grains;
 using Xunit;
+using StreamsForge.Host.Storage;
+using Orleans.Core.Internal;
 
 namespace StreamsForge.Host.Tests;
 
@@ -20,8 +22,8 @@ internal sealed class PolledConnectorSiloConfigurator : ISiloConfigurator
     public void Configure(ISiloBuilder siloBuilder)
     {
         siloBuilder.AddMemoryStreams(StreamConstants.ProviderName);
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.PubSubStoreName);
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.StorageName);
+        siloBuilder.AddPubSubMemoryGrainStorage(StreamConstants.PubSubStoreName);
+        siloBuilder.AddJsonMemoryGrainStorage(StreamConstants.StorageName);
     }
 }
 
@@ -43,14 +45,13 @@ internal sealed class PolledConnectorClientConfigurator : IClientBuilderConfigur
 /// entire design. The plan's opening argument is that an <c>IAsyncEnumerable</c>-shaped SPI would keep the
 /// cursor inside a subscription instance and lose it on every silo recycle; if that claim is not exercised
 /// against an actual deactivation, nothing distinguishes this seam from the one it was written to avoid.
-/// So the deactivation here is Orleans'
-/// (<c>IManagementGrain.ForceActivationCollection</c>, the same mechanism
-/// <see cref="ShardedTableClusterTests"/> uses), and it is <i>verified</i> before the resume is asserted:
-/// the transport records every poll, and the test proves polling STOPPED across a window in which several
-/// scheduled cycles would otherwise have fired. A grain timer does not extend an activation's lifetime
-/// (<c>GrainTimerCreationOptions.KeepAlive</c> defaults to false), which is exactly why the timer dies with
-/// the activation and why the silence is evidence. Stated limit: this harness's grain storage is
-/// <c>AddMemoryGrainStorage</c>, which is silo-host-scoped — it outlives an ACTIVATION, which is exactly
+/// So the deactivation here is Orleans' own explicit one (<c>IGrainManagementExtension.DeactivateOnIdle</c>
+/// — not idle collection, which a running connector is deliberately pinned against since bd147ce), and it
+/// is <i>verified</i> before the resume is asserted: the transport records every poll, and the test proves
+/// polling STOPPED across a window in which several scheduled cycles would otherwise have fired — the
+/// grain timer dies with the activation, which is why the silence is evidence. Stated limit: this harness's
+/// grain storage is <c>AddJsonMemoryGrainStorage</c> (System.Text.Json, production's format), which is
+/// silo-host-scoped — it outlives an ACTIVATION, which is exactly
 /// what is under test, but not a silo restart. Production's durable <c>AddJsonFileGrainStorage</c>
 /// (Program.cs) covers the wider case, and no test here claims it.</para>
 ///
@@ -356,9 +357,11 @@ public sealed class ConnectorGrainPolledClusterTests : IAsyncLifetime
             // memory-stream item would be this test failing on Orleans' plumbing rather than on the cursor.
             await PollUntilAsync(() => Task.FromResult(Snapshot(sink).Count), c => c >= 1);
 
-            // Deactivate for real. A grain timer does not keep an activation alive, so the activation goes
-            // and its timer goes with it.
-            await _cluster.Client.GetGrain<IManagementGrain>(0).ForceActivationCollection(TimeSpan.Zero);
+            // Deactivate for real, and the timer goes with the activation. Not ForceActivationCollection: a
+            // RUNNING connector deliberately pins itself with DelayDeactivation(Infinite) since bd147ce (idle
+            // collection must never stop a live source — SourceIdleCollectionTests), so collection leaves it
+            // alone. An explicit deactivation is what a silo shutdown or a rebalance does to it.
+            await grain.AsReference<IGrainManagementExtension>().DeactivateOnIdle();
 
             // Evidence that it really went: the 1s schedule would have produced several more polls across
             // this window. Silence is only possible if no activation is running the timer.

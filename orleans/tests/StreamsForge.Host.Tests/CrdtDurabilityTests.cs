@@ -13,6 +13,7 @@ using StreamsForge.Abstractions;
 using StreamsForge.Engine;
 using Xunit;
 using Ycs;
+using StreamsForge.Host.Storage;
 
 namespace StreamsForge.Host.Tests;
 
@@ -76,7 +77,7 @@ internal sealed class DurabilityTestSiloConfigurator : ISiloConfigurator
     public void Configure(ISiloBuilder siloBuilder)
     {
         siloBuilder.AddMemoryStreams(StreamConstants.ProviderName);
-        siloBuilder.AddMemoryGrainStorage(StreamConstants.PubSubStoreName);
+        siloBuilder.AddPubSubMemoryGrainStorage(StreamConstants.PubSubStoreName);
         siloBuilder.ConfigureServices(services => services.AddGrainStorage(
             StreamConstants.StorageName,
             (sp, _) => new DurabilitySeedableGrainStorage(
