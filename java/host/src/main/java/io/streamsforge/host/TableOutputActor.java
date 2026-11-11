@@ -68,17 +68,18 @@ final class TableOutputActor implements TableView {
         running = true;
     }
 
+    /** Drops the state (nothing is persisted); subscribers stay, like a stream subscription outliving its producer. */
     void stop() {
         running = false;
         frontier = null;
         buffer = null;
+        ledger.clear();
+        lastEpoch = -1;
     }
 
     void reset() {
         stop();
         exists = false;
-        ledger.clear();
-        lastEpoch = -1;
         out.clear();
     }
 
