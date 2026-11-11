@@ -78,17 +78,17 @@ class EngineIssuesTest {
         assertEquals(7L, only(e.snapshot(), "mx"));
     }
 
-    /** MIN/MAX in isolation: the multiset ignores a retraction of a value it has never seen, so after the assertion the
-     *  value is stuck in the multiset even though its net weight is 0. */
+    /** MIN/MAX in isolation: the group's total weight never reaches 0 here, so the state drop above is not involved. */
     @Test
-    @Disabled("bug: MinMaxZAggregator ignores a retraction of an unseen value (only `weight > 0` creates an entry), so "
-        + "retract(5) before assert(5) leaves 5 in the multiset forever: MAX stays 5 after r2(3) arrives and 5's net weight is 0.")
+    @Disabled("bug: MinMaxZAggregator ignores a retraction of a value it has not seen (only `weight > 0` creates an entry), so "
+        + "retract(5) before assert(5) leaves 5 in the multiset with net weight 0: MAX stays 5 although the rows are {3, 4}.")
     void engineMaxIgnoresRetractionOfUnseenValue() {
         var e = engine("SELECT sym, MAX(qty) AS mx, COUNT(*) AS c FROM trades GROUP BY sym");
-        e.onTableDelta("trades", new TableDelta(trade(0, "B", 1.0, 3L), 1));  // keeps the group alive (total weight > 0)
-        e.onTableDelta("trades", new TableDelta(trade(1, "B", 1.0, 5L), -1)); // retraction first
-        e.onTableDelta("trades", new TableDelta(trade(1, "B", 1.0, 5L), 1));  // then its assertion: net = {3}
-        assertEquals(3L, only(e.snapshot(), "mx"));
+        e.onTableDelta("trades", new TableDelta(trade(0, "B", 1.0, 3L), 1));
+        e.onTableDelta("trades", new TableDelta(trade(0, "B", 1.0, 4L), 1));  // two live rows: the group stays alive throughout
+        e.onTableDelta("trades", new TableDelta(trade(1, "B", 1.0, 5L), -1)); // retraction of 5 first ...
+        e.onTableDelta("trades", new TableDelta(trade(1, "B", 1.0, 5L), 1));  // ... then its assertion: the net rows are {3, 4}
+        assertEquals(4L, only(e.snapshot(), "mx"));
     }
 
     // ------------------------------------------------------------------------------------------------------------
