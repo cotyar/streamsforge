@@ -10,3 +10,8 @@ include("actors-spi")
 include("actors-futures")   // CompletableFuture mailboxes
 include("actors-loom")      // one virtual thread (JDK 21 "green thread") per activation
 include("actors-pekko")     // Apache Pekko typed actors
+// Mini StreamsForge host (sources → pipelines → tables, incl. partitioned tables) written once on actors-spi
+// and run on all three runtimes.
+include("host")
+// Table-mode SQL compiled onto the differential dataflow library, differential-tested against engine's TableExecutor.
+include("engine-dd")
